@@ -1,9 +1,11 @@
-import os
+import json
 import logging
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional
+
 from dotenv import load_dotenv
+
+from agents.communication_agent import generate_llm_response, llm_available
 from database.supabase_client import fetch_investment_thesis
-from agents.communication_agent import generate_llm_response
 
 load_dotenv()
 logger = logging.getLogger("MyInvestmentBanker.agents.risk")
@@ -12,89 +14,196 @@ logging.basicConfig(level=logging.INFO)
 
 class RiskAgent:
     """
-    Acts as the Macro & Portfolio Risk Officer.
-    Analyzes asset correlations, sector concentrations, FRED macro metrics,
-    and correlates incoming corporate data against your personal investment thesis.
+    Acts as the Macro & Portfolio Risk Officer for both portfolio review and discovery.
     """
-    
+
     @staticmethod
-    def run(portfolio: List[Dict[str, Any]], 
-            macro_data: Dict[str, Any], 
-            cfa_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """
-        Executes macro and portfolio allocation auditing.
-        1. Parse portfolio allocations (sectors, weightings).
-        2. Correlate FRED inflation/rate figures to asset exposures.
-        3. Match CFA analyst notes against saved personal investment theses.
-        4. Summarize margin of safety risks and opportunism.
-        """
+    def run(portfolio: List[Dict[str, Any]], macro_data: Dict[str, Any], cfa_reports: List[Dict[str, Any]]) -> Dict[str, Any]:
         logger.info("Risk Agent: Conducting portfolio threat and thesis correlation audit...")
-        
-        # 1. Gather Theses Context
+
         theses_context = ""
-        for h in portfolio:
-            symbol = h["symbol"].upper()
+        for holding in portfolio:
+            symbol = holding["symbol"].upper()
             thesis = fetch_investment_thesis(symbol)
             if thesis:
                 theses_context += f"--- User Thesis on {symbol} ---\n{thesis['thesis_text']}\n\n"
             else:
-                theses_context += f"--- User Thesis on {symbol} ---\nNo thesis logged for this asset. Thesis validation checks skipped.\n\n"
-                
-        # 2. Steer Gemini 3.5 Flash to act as a skeptical Risk Officer
+                theses_context += f"--- User Thesis on {symbol} ---\nNo thesis logged for this asset.\n\n"
+
+        if not llm_available():
+            return {
+                "risk_memo": (
+                    f"Baseline risk review completed across `{len(portfolio)}` holdings. "
+                    f"Macro reference: Fed Funds `{macro_data.get('fed_funds_rate', 'N/A')}`, "
+                    f"Inflation `{macro_data.get('cpi_inflation', macro_data.get('cpi_inflation_index', 'N/A'))}`. "
+                    "Use this run as a structured placeholder until Gemini-backed synthesis is available."
+                ),
+                "summary": "Fallback risk memo generated without Gemini.",
+            }
+
         system_instruction = (
             "You are the Macro & Portfolio Risk Officer of MyInvestmentBanker.\n"
-            "Your tone is skeptical, cautious, and highly analytical.\n"
-            "- Evaluate interest rate sensitivity (floating debt risk) and inflation vulnerabilities.\n"
-            "- Check for sector concentration and overall asset correlation.\n"
-            "- Contrast actual quarterly numbers from the CFA reports with the user's saved theses.\n"
-            "- Explicitly point out where a user's thesis is validated or broken (thesis-drift)."
+            "Your tone is skeptical, cautious, and analytical.\n"
+            "Evaluate macro sensitivity, thesis drift, and structural risk."
         )
-        
         prompt = (
             f"Please conduct a portfolio risk and macro alignment review.\n\n"
             f"=== 1. Active Portfolio Holdings ===\n{portfolio}\n\n"
             f"=== 2. Macroeconomic Environment ===\n{macro_data}\n\n"
             f"=== 3. CFA Analyst Quarterly Reports ===\n{cfa_reports}\n\n"
             f"=== 4. User Investment Theses ===\n{theses_context}\n\n"
-            f"Output a formal risk memo structured as follows:\n"
-            f"- **Macro Threat Alignment**: How macroeconomic trends (interest rates, CPI) specifically pressure or support our holdings.\n"
-            f"- **Thesis Validation & Drift**: Flag specific assets where thesis objectives are being missed or drifted from.\n"
-            f"- **Margin of Safety & Allocation Audits**: Evaluate leverage metrics across holdings, highlighting structural exposures."
+            f"Output a formal risk memo with Macro Threat Alignment, Thesis Validation & Drift, and Margin of Safety & Allocation Audits."
         )
-        
         risk_memo = generate_llm_response(prompt, system_instruction)
-        logger.info("Risk Agent: Portfolio threat assessment memo generated.")
-        
+        return {"risk_memo": risk_memo, "summary": risk_memo.split("\n")[0] if risk_memo else ""}
+
+    @staticmethod
+    def _build_fallback_recommendations(
+        theme: Dict[str, Any],
+        candidate_reviews: List[Dict[str, Any]],
+        policy_profile: Optional[Dict[str, Any]] = None,
+        max_recommendations: int = 3,
+    ) -> Dict[str, Any]:
+        policy_profile = policy_profile or {}
+        ranked = sorted(
+            candidate_reviews,
+            key=lambda item: (
+                item.get("theme_key") in policy_profile.get("preferred_themes", []),
+                item.get("evidence_strength") == "high",
+                item.get("is_existing_position", False),
+                len(item.get("company_catalysts", [])),
+                len(item.get("material_news", [])),
+                len(item.get("relevant_filings", [])),
+            ),
+            reverse=True,
+        )
+
+        recommendations = []
+        rejected = []
+        for review in ranked:
+            if theme.get("theme_key") in policy_profile.get("excluded_themes", []):
+                rejected.append(
+                    {
+                        "symbol": review.get("symbol"),
+                        "reason": "The theme is currently excluded by the user's preference profile.",
+                    }
+                )
+                continue
+
+            signal_quality = (
+                len(review.get("company_catalysts", []))
+                + len(review.get("material_news", []))
+                + len(review.get("relevant_filings", []))
+            )
+            if signal_quality <= 0:
+                rejected.append(
+                    {
+                        "symbol": review.get("symbol"),
+                        "reason": "Evidence set was too thin for a conviction recommendation.",
+                    }
+                )
+                continue
+
+            market_data = review.get("price_context", {})
+            if (
+                policy_profile.get("risk_profile") == "conservative"
+                and market_data.get("beta")
+                and market_data["beta"] > 1.8
+                and not review.get("is_existing_position")
+            ):
+                rejected.append(
+                    {
+                        "symbol": review.get("symbol"),
+                        "reason": "The stock looks too volatile for the user's current conservative risk posture.",
+                    }
+                )
+                continue
+
+            recommendation_type = "increase_existing_position" if review.get("is_existing_position") else "new_position"
+            recommendations.append(
+                {
+                    "symbol": review.get("symbol"),
+                    "recommendation_type": recommendation_type,
+                    "theme_name": theme.get("theme_name"),
+                    "investment_hypothesis": review.get("thesis_alignment") or review.get("why_this_company"),
+                    "why_now": review.get("analyst_verdict"),
+                    "key_risks": review.get("cautions", [])[:3] or ["Evidence is still developing."],
+                    "what_invalidates_it": theme.get("invalidators", [])[:2],
+                    "confidence_note": review.get("confidence_note", "Fallback review without Gemini."),
+                    "source_etf": review.get("source_etf"),
+                    "theme_key": theme.get("theme_key"),
+                    "status": "recommended",
+                    "evidence": {
+                        "catalysts": review.get("company_catalysts", []),
+                        "material_news": review.get("material_news", []),
+                        "relevant_filings": review.get("relevant_filings", []),
+                    },
+                    "rationale": review.get("analyst_verdict", ""),
+                }
+            )
+            if len(recommendations) >= max_recommendations:
+                break
+
         return {
-            "risk_memo": risk_memo
+            "theme_key": theme.get("theme_key"),
+            "theme_name": theme.get("theme_name"),
+            "recommendations": recommendations,
+            "rejected": rejected,
+            "risk_summary": (
+                f"Selected `{len(recommendations)}` recommendation(s) from the "
+                f"{theme.get('theme_name', theme.get('theme_key', 'current'))} theme."
+            ),
         }
 
     @staticmethod
-    def audit_discovery_candidates(candidates: List[Dict[str, Any]], policy_text: str) -> str:
-        """
-        Audits a list of screened candidates against the user's investment policy.
-        Returns a skeptical, analytical recommendation review outlining why these companies
-        pass or fail the standards, and selecting the top 1 or 2 best opportunities.
-        """
-        logger.info(f"Risk Agent: Conducting policy screening audit on {len(candidates)} candidates...")
-        
+    def audit_discovery_theme(
+        theme: Dict[str, Any],
+        candidate_reviews: List[Dict[str, Any]],
+        policy_profile: Dict[str, Any],
+        max_recommendations: int = 3,
+    ) -> Dict[str, Any]:
+        logger.info(
+            f"Risk Agent: Auditing {len(candidate_reviews)} candidates for theme {theme.get('theme_key', 'unknown')}."
+        )
+        if not candidate_reviews:
+            return {
+                "theme_key": theme.get("theme_key"),
+                "theme_name": theme.get("theme_name"),
+                "recommendations": [],
+                "rejected": [],
+                "risk_summary": "No candidates were reviewed for this theme.",
+            }
+
+        if not llm_available():
+            return RiskAgent._build_fallback_recommendations(
+                theme,
+                candidate_reviews,
+                policy_profile=policy_profile,
+                max_recommendations=max_recommendations,
+            )
+
+        prompt_payload = {
+            "theme": theme,
+            "candidate_reviews": candidate_reviews,
+            "policy_profile": policy_profile,
+            "max_recommendations": max_recommendations,
+        }
         system_instruction = (
-            "You are the Macro & Portfolio Risk Officer of MyInvestmentBanker.\n"
-            "Your tone is skeptical, conservative, and highly analytical.\n"
-            "Your job is to audit new investment opportunities against the user's Broad Investment Policy.\n"
-            "- Reject companies with low margins, excessive debt, or weak free cash flow unless the policy specifically allows them.\n"
-            "- Demand a strong Margin of Safety (valuing actual operating cash flow, not projections).\n"
-            "- Recommend the top 1 or 2 strongest prospects, explaining their primary tailwinds and structural risks."
+            "You are the Risk Officer of MyInvestmentBanker.\n"
+            "Choose the best company expressions of the supplied theme.\n"
+            "Return only JSON with keys: recommendations, rejected, risk_summary."
         )
-        
-        prompt = (
-            f"Please conduct an investment opportunity screening audit.\n\n"
-            f"=== 1. User Broad Investment Policy ===\n{policy_text}\n\n"
-            f"=== 2. Screened Candidate Companies ===\n{candidates}\n\n"
-            f"Please evaluate these candidates. Output your final audit memo structured exactly as follows:\n"
-            f"- **Policy Fit & Screening Summary**: A brief summary of which candidates were rejected and why.\n"
-            f"- **Primary Recommendation(s)**: Highlight the top 1 or 2 candidates that best fit the policy, detailing their business strength.\n"
-            f"- **Key Structural Risks**: Skeptically highlight the primary risks/vulnerabilities of the recommended companies (e.g., valuation, sector competition)."
-        )
-        
-        return generate_llm_response(prompt, system_instruction)
+        response = generate_llm_response(str(prompt_payload), system_instruction)
+        try:
+            parsed = json.loads(response.strip().replace("```json", "").replace("```", "").strip())
+        except Exception:
+            parsed = RiskAgent._build_fallback_recommendations(
+                theme,
+                candidate_reviews,
+                policy_profile=policy_profile,
+                max_recommendations=max_recommendations,
+            )
+
+        parsed["theme_key"] = theme.get("theme_key")
+        parsed["theme_name"] = theme.get("theme_name")
+        return parsed
