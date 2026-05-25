@@ -56,16 +56,21 @@ class StreetConsensusAgent:
 
         signal_strength = "low"
 
-        summary = "Street-consensus coverage was thin in this pass."
-        if signal_strength in ["medium", "high"] and alerts:
-            if rating_bucket == "negative":
-                summary = f"Street snapshot leans cautious. {' '.join(alerts[:3])}"
-            elif rating_bucket == "positive":
-                summary = f"Street snapshot leans constructive. {' '.join(alerts[:3])}"
-            else:
-                summary = " ".join(alerts[:3])
-        elif analyst_count or recommendation_key or target_premium_pct is not None:
-            summary = "Analyst snapshot is available, but it does not include a fresh revision signal."
+        if analyst_count or recommendation_key or target_premium_pct is not None:
+            parts = ["Analyst consensus snapshot:"]
+            if recommendation_key or recommendation_mean is not None:
+                rating_str = f"rating is `{recommendation_key}`" if recommendation_key else ""
+                mean_str = f"mean recommendation score is `{recommendation_mean}`" if recommendation_mean is not None else ""
+                desc = " and ".join(filter(None, [rating_str, mean_str]))
+                parts.append(f"The street's current {desc} (leaning {rating_bucket}).")
+            if analyst_count:
+                parts.append(f"Based on `{analyst_count}` analyst opinion(s).")
+            if target_premium_pct is not None:
+                action = "upside" if target_premium_pct >= 0 else "downside"
+                parts.append(f"The mean price target implies `{abs(target_premium_pct)}%` {action} relative to the current price.")
+            summary = " ".join(parts)
+        else:
+            summary = "Street-consensus coverage was thin in this pass."
 
         result: StreetConsensus = {
             "symbol": symbol,

@@ -8,6 +8,8 @@ CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 -- 1. Portfolio Holdings Table
+-- Active positions live here with quantity > 0. Closed positions can be retained with quantity = 0
+-- so thesis and memo history stay attached without needing destructive deletes.
 CREATE TABLE IF NOT EXISTS portfolio_holdings (
     symbol VARCHAR(12) PRIMARY KEY,
     name VARCHAR(255),
@@ -32,8 +34,9 @@ CREATE TRIGGER update_portfolio_holdings_modtime
 
 
 -- 2. User Investment Thesis Table
+-- Do not cascade-delete thesis rows when a holding row is manually removed.
 CREATE TABLE IF NOT EXISTS investment_thesis (
-    symbol VARCHAR(12) PRIMARY KEY REFERENCES portfolio_holdings(symbol) ON DELETE CASCADE,
+    symbol VARCHAR(12) PRIMARY KEY REFERENCES portfolio_holdings(symbol),
     thesis_text TEXT NOT NULL,
     thesis_vector vector(768),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
@@ -49,7 +52,8 @@ CREATE TRIGGER update_investment_thesis_modtime
 -- 3. Corporate Analyst Memos
 CREATE TABLE IF NOT EXISTS corporate_analyst_memos (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    symbol VARCHAR(12) NOT NULL REFERENCES portfolio_holdings(symbol) ON DELETE CASCADE,
+    -- Keep analyst history even if a position is later closed or re-imported.
+    symbol VARCHAR(12) NOT NULL REFERENCES portfolio_holdings(symbol),
     period VARCHAR(20) NOT NULL,
     memo_text TEXT NOT NULL,
     metrics JSONB,
@@ -57,6 +61,7 @@ CREATE TABLE IF NOT EXISTS corporate_analyst_memos (
 );
 
 CREATE INDEX IF NOT EXISTS idx_memos_symbol ON corporate_analyst_memos(symbol);
+CREATE INDEX IF NOT EXISTS idx_memos_symbol_period ON corporate_analyst_memos(symbol, period, created_at DESC);
 
 
 -- 4. Event Cache / News Digests
@@ -76,6 +81,7 @@ CREATE TABLE IF NOT EXISTS news_digests (
 
 CREATE INDEX IF NOT EXISTS idx_news_symbol ON news_digests(symbol);
 CREATE INDEX IF NOT EXISTS idx_news_entity ON news_digests(entity_type, entity_key);
+CREATE INDEX IF NOT EXISTS idx_news_entity_url ON news_digests(entity_type, entity_key, url);
 CREATE INDEX IF NOT EXISTS idx_news_vector ON news_digests USING hnsw (article_vector vector_cosine_ops);
 
 
@@ -85,6 +91,12 @@ CREATE TABLE IF NOT EXISTS user_preferences (
     value JSONB NOT NULL,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT timezone('utc'::text, now()) NOT NULL
 );
+
+DROP TRIGGER IF EXISTS update_user_preferences_modtime ON user_preferences;
+CREATE TRIGGER update_user_preferences_modtime
+    BEFORE UPDATE ON user_preferences
+    FOR EACH ROW
+    EXECUTE FUNCTION update_modified_column();
 
 
 -- 6. Short-Term Memory: Secure Chat Logs & Checkpoints

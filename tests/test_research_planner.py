@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 if "requests" not in sys.modules:
     requests_stub = types.ModuleType("requests")
+    requests_exceptions_stub = types.ModuleType("requests.exceptions")
 
     class RequestException(Exception):
         pass
@@ -12,10 +13,18 @@ if "requests" not in sys.modules:
     class HTTPError(RequestException):
         pass
 
+    class Session:
+        pass
+
     requests_stub.RequestException = RequestException
     requests_stub.HTTPError = HTTPError
+    requests_stub.Session = Session
     requests_stub.get = lambda *args, **kwargs: None
+    requests_exceptions_stub.RequestException = RequestException
+    requests_exceptions_stub.HTTPError = HTTPError
+    requests_stub.exceptions = requests_exceptions_stub
     sys.modules["requests"] = requests_stub
+    sys.modules["requests.exceptions"] = requests_exceptions_stub
 
 if "yfinance" not in sys.modules:
     yfinance_stub = types.ModuleType("yfinance")
@@ -39,6 +48,19 @@ if "google.generativeai" not in sys.modules:
     google_stub.generativeai = generativeai_stub
     sys.modules["google"] = google_stub
     sys.modules["google.generativeai"] = generativeai_stub
+
+if "llmlingua" not in sys.modules:
+    llmlingua_stub = types.ModuleType("llmlingua")
+
+    class PromptCompressor:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def compress_prompt(self, *args, **kwargs):
+            return {"compressed_prompt": ""}
+
+    llmlingua_stub.PromptCompressor = PromptCompressor
+    sys.modules["llmlingua"] = llmlingua_stub
 
 if "supabase" not in sys.modules:
     supabase_stub = types.ModuleType("supabase")

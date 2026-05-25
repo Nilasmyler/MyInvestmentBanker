@@ -1,5 +1,6 @@
 import logging
 import os
+import secrets
 
 import httpx
 from dotenv import load_dotenv
@@ -20,12 +21,51 @@ load_dotenv()
 logger = logging.getLogger("MyInvestmentBanker.main")
 logging.basicConfig(level=logging.INFO)
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_USER_ID = os.getenv("TELEGRAM_USER_ID")
+LOCAL_MOCK_CHAT_ID = "local-mock"
+TELEGRAM_SECRET_HEADER = "X-Telegram-Bot-Api-Secret-Token"
+SCHEDULED_SECRET_HEADER = "X-Scheduled-Run-Secret"
 
-if not TELEGRAM_BOT_TOKEN or not TELEGRAM_USER_ID:
+
+def _get_env(name: str) -> str:
+    return os.getenv(name, "").strip()
+
+
+def get_telegram_bot_token() -> str:
+    return _get_env("TELEGRAM_BOT_TOKEN")
+
+
+def get_telegram_user_id() -> str:
+    return _get_env("TELEGRAM_USER_ID")
+
+
+def get_telegram_webhook_secret() -> str:
+    return _get_env("TELEGRAM_WEBHOOK_SECRET")
+
+
+def get_scheduled_run_secret() -> str:
+    return _get_env("SCHEDULED_RUN_SECRET")
+
+
+def telegram_live_delivery_enabled() -> bool:
+    return bool(get_telegram_bot_token() and get_telegram_user_id())
+
+
+def scheduled_run_live_mode() -> bool:
+    return bool(get_telegram_bot_token())
+
+
+def get_dispatch_chat_id() -> str:
+    return get_telegram_user_id() or LOCAL_MOCK_CHAT_ID
+
+
+def verify_secret_header(request: Request, header_name: str, expected_secret: str) -> bool:
+    provided_secret = request.headers.get(header_name, "")
+    return bool(provided_secret) and secrets.compare_digest(provided_secret, expected_secret)
+
+
+if not telegram_live_delivery_enabled():
     logger.warning(
-        "TELEGRAM_BOT_TOKEN or TELEGRAM_USER_ID is not configured in .env. Bot features will run in mock mode."
+        "TELEGRAM_BOT_TOKEN or TELEGRAM_USER_ID is not fully configured in .env. Bot features will run in mock mode."
     )
 
 app = FastAPI(
@@ -36,12 +76,23 @@ app = FastAPI(
 
 
 async def send_telegram_message(chat_id: str, text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN:
-        logger.warning("Telegram token missing. Printing message to stdout instead:")
+    telegram_bot_token = get_telegram_bot_token()
+    telegram_user_id = get_telegram_user_id()
+
+    if not telegram_bot_token or not telegram_user_id:
+        logger.warning("Telegram live delivery disabled. Printing message to stdout instead:")
         logger.info(f"\n[Telegram Bot Dispatch to {chat_id}]:\n{text}\n")
         return True
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    if chat_id != telegram_user_id:
+        logger.error(
+            "Refusing Telegram delivery to unexpected chat_id '%s'. Configured user is '%s'.",
+            chat_id,
+            telegram_user_id,
+        )
+        return False
+
+    url = f"https://api.telegram.org/bot{telegram_bot_token}/sendMessage"
     payload = {
         "chat_id": chat_id,
         "text": text,
@@ -128,6 +179,22 @@ async def background_single_stock_analysis(chat_id: str, symbol: str, user_conte
 
 @app.post("/telegram-webhook")
 async def telegram_webhook_receiver(request: Request, background_tasks: BackgroundTasks):
+    telegram_bot_token = get_telegram_bot_token()
+    telegram_user_id = get_telegram_user_id()
+    telegram_webhook_secret = get_telegram_webhook_secret()
+
+    if telegram_bot_token and not telegram_user_id:
+        logger.error("Rejected live Telegram webhook because TELEGRAM_USER_ID is missing.")
+        raise HTTPException(status_code=503, detail="TELEGRAM_USER_ID must be configured for live Telegram mode.")
+
+    if telegram_bot_token and not telegram_webhook_secret:
+        logger.error("Rejected live Telegram webhook because TELEGRAM_WEBHOOK_SECRET is missing.")
+        raise HTTPException(status_code=503, detail="TELEGRAM_WEBHOOK_SECRET must be configured for live Telegram mode.")
+
+    if telegram_webhook_secret and not verify_secret_header(request, TELEGRAM_SECRET_HEADER, telegram_webhook_secret):
+        logger.warning("Rejected Telegram webhook request with an invalid secret token header.")
+        raise HTTPException(status_code=403, detail="Invalid Telegram secret token.")
+
     try:
         body = await request.json()
     except Exception:
@@ -143,14 +210,13 @@ async def telegram_webhook_receiver(request: Request, background_tasks: Backgrou
     if not chat_id or not sender_id:
         return {"status": "ignored", "reason": "No valid message sender info found."}
 
-    if TELEGRAM_USER_ID and sender_id != TELEGRAM_USER_ID:
-        logger.warning(f"Unauthorized access attempt! Sender: {sender_id} (Name: {user_info.get('username')})")
-        background_tasks.add_task(
-            send_telegram_message,
-            chat_id,
-            "🔒 **Access Denied**: This wealth manager instance is strictly configured for a single private portfolio.",
-        )
+    if telegram_user_id and sender_id != telegram_user_id:
+        logger.warning("Unauthorized Telegram sender rejected: %s (Name: %s)", sender_id, user_info.get("username"))
         return {"status": "rejected", "reason": "Unauthorized User ID"}
+
+    if telegram_user_id and chat_id != telegram_user_id:
+        logger.warning("Unauthorized Telegram chat rejected: %s", chat_id)
+        return {"status": "rejected", "reason": "Unauthorized Chat ID"}
 
     log_chat_message(chat_id, "user", message_text, {"username": user_info.get("username")})
 
@@ -182,35 +248,53 @@ async def telegram_webhook_receiver(request: Request, background_tasks: Backgrou
 
 
 @app.post("/scheduled-run")
-def scheduled_daily_digest(run_type: str = "daily", background_tasks: BackgroundTasks = None):
-    if not TELEGRAM_USER_ID:
-        raise HTTPException(status_code=400, detail="TELEGRAM_USER_ID is not configured in .env.")
+def scheduled_daily_digest(request: Request, background_tasks: BackgroundTasks, run_type: str = "daily"):
+    scheduled_run_secret = get_scheduled_run_secret()
+    target_chat_id = get_dispatch_chat_id()
+
+    if not scheduled_run_secret and scheduled_run_live_mode():
+        logger.error("Rejected scheduled run because SCHEDULED_RUN_SECRET is missing while live Telegram mode is enabled.")
+        raise HTTPException(status_code=503, detail="SCHEDULED_RUN_SECRET must be configured for live scheduled runs.")
+
+    if scheduled_run_secret and not verify_secret_header(request, SCHEDULED_SECRET_HEADER, scheduled_run_secret):
+        logger.warning("Rejected scheduled run with an invalid shared secret header.")
+        raise HTTPException(status_code=403, detail="Invalid scheduled run secret.")
 
     if run_type in ["weekly_discovery", "monday_deep_discovery"]:
         logger.info("Cron Trigger: Initiating weekly deep discovery run...")
-        background_tasks.add_task(background_discovery_execution, TELEGRAM_USER_ID, "deep")
+        background_tasks.add_task(background_discovery_execution, target_chat_id, "deep")
         return {
             "status": "cron_initiated",
             "run_type": run_type,
-            "target_user_id": TELEGRAM_USER_ID,
+            "target_user_id": target_chat_id,
             "workflow": "Theme-Led Deep Discovery",
         }
 
     if run_type in ["discovery_sweep", "autonomous_discovery", "hourly_news_sweep"]:
         logger.info("Cron Trigger: Initiating weekday discovery sweep...")
-        background_tasks.add_task(background_discovery_execution, TELEGRAM_USER_ID, "sweep")
+        background_tasks.add_task(background_discovery_execution, target_chat_id, "sweep")
         return {
             "status": "cron_initiated",
             "run_type": run_type,
-            "target_user_id": TELEGRAM_USER_ID,
+            "target_user_id": target_chat_id,
             "workflow": "Theme Discovery Sweep",
         }
 
+    if run_type in ["weekly_portfolio", "monday_portfolio", "monday_update"]:
+        logger.info("Cron Trigger: Initiating weekly portfolio digest...")
+        background_tasks.add_task(background_pipeline_execution, target_chat_id)
+        return {
+            "status": "cron_initiated",
+            "run_type": run_type,
+            "target_user_id": target_chat_id,
+            "workflow": "Weekly Portfolio Digest",
+        }
+
     logger.info("Cron Trigger: Initiating scheduled portfolio digest...")
-    background_tasks.add_task(background_pipeline_execution, TELEGRAM_USER_ID)
+    background_tasks.add_task(background_pipeline_execution, target_chat_id)
     return {
         "status": "cron_initiated",
         "run_type": run_type,
-        "target_user_id": TELEGRAM_USER_ID,
+        "target_user_id": target_chat_id,
         "workflow": "LangGraph Portfolio Flow",
     }

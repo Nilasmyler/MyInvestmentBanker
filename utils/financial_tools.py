@@ -66,6 +66,15 @@ def _safe_int(value: Any) -> Optional[int]:
             return None
 
 
+def _parse_fred_numeric(value: Any) -> Optional[float]:
+    if value in [None, "", "."]:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _format_table_value(value: Any) -> Any:
     if value is None:
         return None
@@ -239,7 +248,7 @@ def fetch_recent_sec_ownership_filings(ticker: str, limit: Optional[int] = None)
 
 def fetch_macro_indicators() -> Dict[str, Any]:
     """
-    Queries FRED for key indicators: Fed Funds Rate, Inflation (CPI), and GDP.
+    Queries FRED for key indicators: Fed Funds Rate, CPI-based year-over-year inflation, and GDP.
     Includes a static robust fallback if FRED_API_KEY is not set.
     """
     if not FRED_API_KEY:
@@ -267,7 +276,7 @@ def fetch_macro_indicators() -> Dict[str, Any]:
             "api_key": FRED_API_KEY,
             "file_type": "json",
             "sort_order": "desc",
-            "limit": 1,
+            "limit": 13 if name == "cpi" else 1,
         }
         try:
             response = requests.get(base_url, params=params, timeout=10)
@@ -275,17 +284,35 @@ def fetch_macro_indicators() -> Dict[str, Any]:
                 data = response.json()
                 obs = data.get("observations", [])
                 if obs:
-                    results[name] = {
-                        "date": obs[0]["date"],
-                        "value": f"{float(obs[0]['value']):.2f}%" if name != "cpi" else obs[0]["value"],
-                    }
+                    latest_value = _parse_fred_numeric(obs[0].get("value"))
+                    if name == "cpi":
+                        year_ago_value = _parse_fred_numeric(obs[12].get("value")) if len(obs) >= 13 else None
+                        inflation_rate = None
+                        if latest_value not in [None, 0] and year_ago_value not in [None, 0]:
+                            inflation_rate = round(((latest_value - year_ago_value) / year_ago_value) * 100, 2)
+                        results[name] = {
+                            "date": obs[0].get("date"),
+                            "index_value": latest_value,
+                            "inflation_rate": inflation_rate,
+                        }
+                    elif latest_value is not None:
+                        results[name] = {
+                            "date": obs[0].get("date"),
+                            "value": f"{latest_value:.2f}%",
+                        }
         except Exception as e:
             logger.error(f"Failed to fetch FRED series {series_id}: {e}")
+
+    cpi_data = results.get("cpi", {})
+    inflation_rate = cpi_data.get("inflation_rate")
+    inflation_text = f"{inflation_rate:.2f}% YoY" if inflation_rate is not None else "N/A"
+    cpi_index_value = cpi_data.get("index_value")
 
     return {
         "source": "FRED Live Feeds",
         "fed_funds_rate": results.get("fed_funds", {}).get("value", "N/A"),
-        "cpi_inflation_index": results.get("cpi", {}).get("value", "N/A"),
+        "cpi_inflation": inflation_text,
+        "cpi_inflation_index": f"{cpi_index_value:.3f}" if cpi_index_value is not None else "N/A",
         "gdp_growth_rate": results.get("gdp", {}).get("value", "N/A"),
     }
 

@@ -128,14 +128,17 @@ class BrokerageIntegrationTests(unittest.TestCase):
         self.assertEqual(session.calls[1]["url"], "https://paper-api.alpaca.markets/v2/positions")
 
     @patch("services.portfolio_service.save_user_preference")
+    @patch("services.portfolio_service.get_user_preference")
     @patch("services.portfolio_service.replace_portfolio_holdings")
     @patch("services.portfolio_service.read_brokerage_portfolio")
     def test_sync_portfolio_from_brokerage_persists_snapshot(
         self,
         mock_read_brokerage_portfolio,
         mock_replace_portfolio_holdings,
+        mock_get_user_preference,
         mock_save_user_preference,
     ):
+        mock_get_user_preference.return_value = []
         mock_read_brokerage_portfolio.return_value = {
             "ok": True,
             "provider": "alpaca",
@@ -168,7 +171,10 @@ class BrokerageIntegrationTests(unittest.TestCase):
         self.assertEqual(result["imported_count"], 1)
         self.assertEqual(result["removed_symbols"], ["TSLA"])
         self.assertEqual(result["holdings"][0]["symbol"], "MSFT")
-        mock_save_user_preference.assert_called_once()
+        self.assertGreaterEqual(mock_save_user_preference.call_count, 2)
+        saved_keys = [call.args[0] for call in mock_save_user_preference.call_args_list]
+        self.assertIn("portfolio_snapshot_history", saved_keys)
+        self.assertIn("brokerage_sync_status", saved_keys)
 
     @patch("services.portfolio_service.read_brokerage_portfolio")
     @patch("services.portfolio_service.fetch_portfolio")

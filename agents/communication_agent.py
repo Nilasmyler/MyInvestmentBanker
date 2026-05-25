@@ -16,10 +16,12 @@ from database.supabase_client import (
     update_portfolio_holding,
 )
 from services.portfolio_service import (
+    build_portfolio_change_summary,
     brokerage_enabled,
     get_portfolio_snapshot,
     should_sync_portfolio_before_analysis,
     should_sync_portfolio_on_read,
+    summarize_portfolio_state,
     sync_portfolio_from_brokerage,
 )
 from utils.discovery_support import (
@@ -73,6 +75,13 @@ def _parse_iso(raw_value: str) -> Optional[datetime]:
         return datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
     except Exception:
         return None
+
+
+def _format_human_date(raw_value: str) -> str:
+    parsed = _parse_iso(raw_value)
+    if not parsed:
+        return "the prior snapshot"
+    return parsed.strftime("%Y-%m-%d")
 
 
 def _extract_json_payload(raw_text: str) -> Optional[Dict[str, Any]]:
@@ -341,6 +350,65 @@ class CommunicationAgent:
         return f"{value:.0f} USD"
 
     @staticmethod
+    def _build_portfolio_change_lines(portfolio_state: List[Dict[str, Any]]) -> List[str]:
+        snapshot_summary = build_portfolio_change_summary(portfolio_state)
+        current_snapshot = snapshot_summary.get("current_snapshot") or {}
+        baseline_snapshot = snapshot_summary.get("baseline_snapshot") or {}
+
+        lines = []
+        current_market_value = current_snapshot.get("total_market_value")
+        if current_market_value is not None:
+            lines.append(f"Current tracked market value is `{float(current_market_value):.2f}` USD.")
+        else:
+            lines.append(
+                f"Tracked cost basis across active holdings is `{float(current_snapshot.get('total_cost_basis', 0.0)):.2f}` USD."
+            )
+
+        if not baseline_snapshot:
+            lines.append("This is the first stored portfolio baseline, so value-change tracking starts from this run.")
+            return lines
+
+        baseline_date = _format_human_date(str(baseline_snapshot.get("captured_at", "")))
+        elapsed_days = snapshot_summary.get("elapsed_days")
+        comparison_label = (
+            f"vs the prior weekly baseline from `{baseline_date}`"
+            if elapsed_days is not None and elapsed_days >= 6
+            else f"vs the prior recorded snapshot from `{baseline_date}`"
+        )
+
+        market_value_change = snapshot_summary.get("market_value_change")
+        market_value_change_pct = snapshot_summary.get("market_value_change_pct")
+        if market_value_change is not None:
+            direction = "up" if market_value_change >= 0 else "down"
+            change_text = f"{abs(float(market_value_change)):.2f}"
+            pct_text = f" ({market_value_change_pct:+.2f}%)" if market_value_change_pct is not None else ""
+            lines.append(f"Portfolio value is {direction} `{change_text}` USD{pct_text} {comparison_label}.")
+        else:
+            cost_basis_change = float(snapshot_summary.get("cost_basis_change", 0.0))
+            direction = "higher" if cost_basis_change >= 0 else "lower"
+            lines.append(
+                f"Cost basis is `{abs(cost_basis_change):.2f}` USD {direction} {comparison_label}, but live market values were not available in both snapshots."
+            )
+
+        new_positions = snapshot_summary.get("new_positions", [])
+        if new_positions:
+            lines.append(f"New active positions since then: `{', '.join(new_positions)}`.")
+
+        removed_positions = snapshot_summary.get("removed_positions", [])
+        if removed_positions:
+            lines.append(f"Positions that left the active book since then: `{', '.join(removed_positions)}`.")
+
+        largest_position_changes = snapshot_summary.get("largest_position_changes", [])
+        if largest_position_changes:
+            move_parts = []
+            for item in largest_position_changes[:2]:
+                pct_text = f" ({item['delta_pct']:+.2f}%)" if item.get("delta_pct") is not None else ""
+                move_parts.append(f"{item['symbol']} `{item['delta']:+.2f}` USD{pct_text}")
+            lines.append("Largest position-value moves: " + "; ".join(move_parts) + ".")
+
+        return lines
+
+    @staticmethod
     def _infer_theme_from_symbol_research(
         symbol: str,
         research: Dict[str, Any],
@@ -362,9 +430,6 @@ class CommunicationAgent:
         for etf, item in registry.items():
             if any(keyword in lookup_text for keyword in item.get("keywords", [])):
                 matching_etfs.append(etf)
-
-        if not matching_etfs:
-            matching_etfs = list(policy_profile.get("priority_etfs", []))[:1]
 
         if matching_etfs and matching_etfs[0] in registry:
             record = registry[matching_etfs[0]]
@@ -495,8 +560,9 @@ class CommunicationAgent:
 
         return (
             "❓ **Follow-up Question**\n"
-            f"This review looks most connected to **{theme.get('theme_name', 'this theme')}**.\n"
-            "Reply with one of these predefined actions:\n"
+            f"This review looks most connected to **{theme.get('theme_name', 'this theme')}**. "
+            "How would you like to handle this theme and company going forward in your personal discovery policy?\n"
+            "You can reply in plain language or use one of these predefined actions:\n"
             "• `focus theme` — keep this theme in active discovery focus\n"
             "• `exclude theme` — stop surfacing this theme\n"
             "• `snooze idea` — suppress this exact idea for 14 days\n"
@@ -575,8 +641,9 @@ class CommunicationAgent:
         symbol = primary_recommendation.get("symbol", "this idea")
         return (
             "❓ **Follow-up Question**\n"
-            f"The strongest thread in this run was **{theme_name}**, with **{symbol}** as the clearest expression.\n"
-            "Reply with one of these predefined actions:\n"
+            f"The strongest thread in this run was **{theme_name}**, with **{symbol}** as the clearest expression. "
+            "How does this align with your current thesis or focus? Would you like to adjust your discovery policy for this theme?\n"
+            "You can reply in plain language or use one of these predefined actions:\n"
             "• `focus theme` — keep this theme in active discovery focus\n"
             "• `exclude theme` — stop surfacing this theme\n"
             "• `snooze idea` — suppress this exact idea for 14 days\n"
@@ -605,8 +672,9 @@ class CommunicationAgent:
 
         return (
             "❓ **Follow-up Question**\n"
-            f"I still do not have your investment thesis for **{missing_thesis_symbol}**.\n"
-            "Reply with one of these predefined actions:\n"
+            f"I still do not have your investment thesis logged for **{missing_thesis_symbol}**. "
+            "What is your core investment hypothesis or primary reason for holding this position?\n"
+            "You can reply in plain language or use one of these predefined actions:\n"
             f"• `thesis {missing_thesis_symbol} [your thesis]` — store your reasoning\n"
             "• `skip` — clear this follow-up"
         )
@@ -754,19 +822,13 @@ class CommunicationAgent:
                         f"Reason: `{sync_result.get('reason', 'unknown error')}`\n\n"
                     )
 
-            total_cost = 0.0
-            total_market_value = 0.0
-            have_market_values = False
+            portfolio_summary = summarize_portfolio_state(holdings)
             for idx, holding in enumerate(holdings):
                 ticker = holding["symbol"]
                 qty = float(holding["quantity"])
                 price = float(holding["cost_basis"])
-                total_cost += qty * price
                 market_value = holding.get("market_value")
                 current_price = holding.get("current_price")
-                if market_value is not None:
-                    total_market_value += float(market_value)
-                    have_market_values = True
                 thesis = fetch_investment_thesis(ticker)
                 thesis_flag = "I have your thesis on file." if thesis else "I still need your thesis for this position."
                 report += (
@@ -780,9 +842,12 @@ class CommunicationAgent:
                 if market_value is not None:
                     report += f"   • Current market value: `{float(market_value):.2f}` USD.\n"
                 report += "\n"
-            report += f"📊 **Total cost basis logged:** `{total_cost:.2f}` USD"
-            if have_market_values:
-                report += f"\n📈 **Total market value from broker snapshot:** `{total_market_value:.2f}` USD"
+            report += f"📊 **Total cost basis logged:** `{float(portfolio_summary['total_cost_basis']):.2f}` USD"
+            if portfolio_summary.get("market_values_available"):
+                report += (
+                    f"\n📈 **Total market value from broker snapshot:** "
+                    f"`{float(portfolio_summary['total_market_value']):.2f}` USD"
+                )
             return report
 
         if cmd == "/sync":
@@ -1001,6 +1066,48 @@ class CommunicationAgent:
         street_consensus = research.get("street_consensus", {})
         company_name = market_data.get("name", symbol)
 
+        if llm_available():
+            system_instruction = (
+                "You are the Senior Private Wealth Manager & Investment Banker of MyInvestmentBanker.\n"
+                "You are writing a bespoke, highly customized investment briefing directly to a sophisticated private client.\n"
+                "Your tone is elite, conversational, analytical, and authoritative.\n"
+                "Write a highly concise, punchy memo. The client reads this on a mobile device; keep the entire response under 300 words total.\n"
+                "Avoid verbose filler, generic boilerplate, or long intros. Use short, dense paragraphs to deliver high analytical value.\n"
+                "Interpret all evidence in context (metrics, ownership, filings) rather than listing raw data, filtering out low-value content farm noise (e.g. Benzinga/SeekingAlpha).\n"
+                "Format in clean, Telegram-compatible Markdown with bold terms."
+            )
+            prompt = (
+                f"Please write a highly concise, professional private investment memo for **{symbol}** ({company_name}) based on the following evidence.\n\n"
+                f"=== 1. Active Client Discovery Policy ===\n{policy_profile}\n\n"
+                f"=== 2. Market Pricing, Valuations & Technicals ===\n{market_data}\n\n"
+                f"=== 3. SEC Filings ===\n{relevant_filings}\n\n"
+                f"=== 4. Material Corporate News ===\n{material_news}\n\n"
+                f"=== 5. Ownership Intel ===\n{ownership_intel}\n\n"
+                f"=== 6. Street Analyst Consensus ===\n{street_consensus}\n\n"
+                f"=== 7. CFA Analyst Verdict & Theme Context ===\n"
+                f"Theme: {theme}\n"
+                f"Candidate alignment: {candidate_review}\n"
+                f"Risk officer audit recommendation: {recommendation}\n\n"
+                f"Structure your response exactly as follows, keeping each section extremely brief (max 2-3 sentences per section, total word count under 300 words):\n"
+                f"1. **Bespoke Executive Recommendation** (Refined, actionable recommendation in natural language)\n"
+                f"2. **The Fundamental Investment Thesis** (Moat, business model, and sector context)\n"
+                f"3. **Material Catalysts & Evidence Synthesis** (Synthesize recent SEC filings, owner shifts, and material news fluidly—do not list raw headlines)\n"
+                f"4. **Core Valuation Hurdles & Risk Factors** (Analytical review of P/E, analyst targets, and key invalidators)\n\n"
+                f"Ensure the memo is cohesive, deeply analytical, and highly concise."
+            )
+            narrative = generate_llm_response(prompt, system_instruction)
+            if narrative:
+                action_suffix = ""
+                if recommendation:
+                    action_hint = (
+                        f"`/add {symbol} PRICE QTY`"
+                        if recommendation.get("recommendation_type") == "new_position"
+                        else f"`/thesis {symbol} [updated thesis]`"
+                    )
+                    action_suffix = f"\n\n👉 **Suggested Manual Step**: {action_hint}"
+                return f"🔬 **Single-Stock Review: {symbol}**\n\n{narrative}{action_suffix}"
+
+        # FALLBACK: Deterministic reporting block for robust offline/mock execution
         lines = [
             f"🔬 **Single-Stock Review: {symbol}**",
             "",
@@ -1047,13 +1154,35 @@ class CommunicationAgent:
 
         if material_news:
             lines.append(
-                f"• I captured `{len(material_news)}` recent material news item(s), which suggests the story is still active rather than stale."
+                f"• Recent material news item(s):"
             )
+            for item in material_news[:2]:
+                headline = (item.get("headline") or "").strip()
+                url = item.get("url") or ""
+                source = item.get("source") or "News"
+                why = item.get("why_material") or ""
+                
+                headline_link = f"[{headline}]({url})" if url else headline
+                news_detail = f"  - **{headline_link}** ({source})"
+                if why:
+                    news_detail += f" | *Materiality:* {why}"
+                lines.append(news_detail)
         if relevant_filings:
-            latest_filing = relevant_filings[0]
             lines.append(
-                f"• The latest SEC checkpoint is a `{latest_filing.get('form', 'filing')}` from `{latest_filing.get('date', 'unknown date')}`, which gives a fresh corporate anchor for the thesis."
+                f"• Recent SEC checkpoint(s):"
             )
+            for filing in relevant_filings[:1]:
+                form = filing.get("form") or "filing"
+                date = filing.get("date") or "unknown date"
+                url = filing.get("report_url") or ""
+                desc = (filing.get("description") or "").strip()
+                
+                form_link = f"[{form}]({url})" if url else form
+                filing_detail = f"  - **{form_link}** on {date}"
+                if desc:
+                    cropped_desc = desc[:80] + "..." if len(desc) > 80 else desc
+                    filing_detail += f": {cropped_desc}"
+                lines.append(filing_detail)
         if ownership_intel.get("summary"):
             lines.append(f"• Ownership view: {ownership_intel.get('summary')}")
         if street_consensus.get("summary"):
@@ -1077,14 +1206,14 @@ class CommunicationAgent:
         invalidators = recommendation.get("what_invalidates_it") if recommendation else theme.get("invalidators", [])
         lines.extend(["", "⚠️ **What Could Go Wrong**"])
         if risks:
-            for risk in risks[:3]:
+            for risk in risks[:2]:
                 lines.append(f"• {risk}")
         else:
             lines.append("• The evidence set is still incomplete, so confidence should stay measured.")
 
         if invalidators:
             lines.extend(["", "🛑 **What Would Change The View**"])
-            for invalidator in invalidators[:2]:
+            for invalidator in invalidators[:1]:
                 lines.append(f"• {invalidator}")
 
         lines.extend(
@@ -1113,15 +1242,23 @@ class CommunicationAgent:
         cfa_memos: List[Dict[str, Any]],
         risk_memos: Dict[str, Any],
     ) -> str:
+        portfolio_change_lines = CommunicationAgent._build_portfolio_change_lines(portfolio_state)
         if not llm_available():
             lines = [
                 "📈 **Portfolio Digest**",
                 "",
-                "In plain language:",
-                f"• {CommunicationAgent._macro_interpretation(macro_data)}",
-                f"• I reviewed `{len(portfolio_state)}` holding(s) in this cycle.",
-                "",
+                "📊 **Snapshot Change Summary**",
             ]
+            lines.extend([f"• {line}" for line in portfolio_change_lines])
+            lines.extend(
+                [
+                    "",
+                    "In plain language:",
+                    f"• {CommunicationAgent._macro_interpretation(macro_data)}",
+                    f"• I reviewed `{len(portfolio_state)}` holding(s) in this cycle.",
+                    "",
+                ]
+            )
             if cfa_memos:
                 lines.append("🧾 **What Stood Out In Individual Names**")
                 for memo in cfa_memos[:5]:
@@ -1138,25 +1275,33 @@ class CommunicationAgent:
 
         system_instruction = (
             "You are the Lead Portfolio Synthesis Manager of MyInvestmentBanker.\n"
-            "Write in plain language first. Be specific but understandable.\n"
-            "If you mention any metric or valuation datapoint, immediately explain what it means.\n"
-            "Avoid metric laundry lists and avoid unexplained jargon.\n"
+            "Write a highly concise, professional portfolio synthesis briefing.\n"
+            "Keep the entire synthesis under 250 words total, suitable for a mobile screen.\n"
+            "Use very short, punchy paragraphs and explain any cited metrics immediately without jargon.\n"
+            "Avoid metric laundry lists and verbose preamble.\n"
             "Format in clean Telegram-compatible Markdown."
         )
         prompt = (
-            f"Please synthesize the following data streams into a professional personal investment briefing.\n\n"
+            f"Please synthesize the following data streams into a highly concise portfolio briefing.\n\n"
             f"=== 1. Active Portfolio State ===\n{portfolio_state}\n\n"
-            f"=== 2. Macroeconomic Indicators ===\n{macro_data}\n\n"
-            f"=== 3. CFA Analyst Memos ===\n{cfa_memos}\n\n"
-            f"=== 4. Portfolio Risk Review ===\n{risk_memos}\n\n"
-            f"Structure the output as:\n"
-            f"1. Plain-language executive summary\n"
-            f"2. What changed and why it matters\n"
-            f"3. Risks worth paying attention to\n"
-            f"4. Opportunities or follow-up items\n"
-            f"Keep it concise and explain the meaning of any evidence you cite."
+            f"=== 2. Deterministic Portfolio Snapshot Summary ===\n{portfolio_change_lines}\n\n"
+            f"=== 3. Macroeconomic Indicators ===\n{macro_data}\n\n"
+            f"=== 4. CFA Analyst Memos ===\n{cfa_memos}\n\n"
+            f"=== 5. Portfolio Risk Review ===\n{risk_memos}\n\n"
+            f"Structure the output exactly as follows, keeping each section to 2-3 dense sentences (total word count under 250 words):\n"
+            f"1. **Executive Summary** (Plain-language overview)\n"
+            f"2. **Key Portfolio Dynamics** (What changed and why)\n"
+            f"3. **Material Risks & Thesis Drift** (Risks worth paying attention to)\n"
+            f"4. **Actionable Recommendations** (Opportunities or manual next steps)\n\n"
+            f"Keep it extremely concise and direct."
         )
-        return generate_llm_response(prompt, system_instruction)
+        narrative = generate_llm_response(prompt, system_instruction)
+        deterministic_header = ["📈 **Portfolio Digest**", "", "📊 **Snapshot Change Summary**"]
+        deterministic_header.extend([f"• {line}" for line in portfolio_change_lines])
+        deterministic_header.extend(["", "🧠 **Manager Interpretation**"])
+        if narrative:
+            deterministic_header.append(narrative)
+        return "\n".join(deterministic_header)
 
     @staticmethod
     def compile_discovery_briefing(discovery_result: Dict[str, Any]) -> str:
@@ -1193,33 +1338,53 @@ class CommunicationAgent:
         lines.append("💡 **Ideas Worth A Closer Look**")
         for idx, recommendation in enumerate(recommendations[:3], start=1):
             evidence_sentences = []
-            evidence = recommendation.get("evidence", {})
+            evidence = recommendation.get("evidence") or {}
             if evidence.get("catalysts"):
                 evidence_sentences.append(
                     "Current catalysts include " + "; ".join(str(item) for item in evidence["catalysts"][:2]) + "."
                 )
-            if evidence.get("material_news"):
+            if evidence.get("material_news") and isinstance(evidence.get("material_news"), list):
+                news_items = evidence["material_news"]
+                news_headlines = []
+                for item in news_items[:2]:
+                    h = (item.get("headline") or "").strip()
+                    u = item.get("url") or ""
+                    if h:
+                        news_headlines.append(f"[{h}]({u})" if u else h)
+                if news_headlines:
+                    evidence_sentences.append("Recent news: " + "; ".join(news_headlines) + ".")
+            elif evidence.get("material_news"):
                 evidence_sentences.append("Recent news is adding support to the thesis.")
-            if evidence.get("relevant_filings"):
+
+            if evidence.get("relevant_filings") and isinstance(evidence.get("relevant_filings"), list):
+                filing_items = evidence["relevant_filings"]
+                filing_desc = []
+                for filing in filing_items[:1]:
+                    form = filing.get("form") or "filing"
+                    url = filing.get("report_url") or ""
+                    date = filing.get("date") or ""
+                    form_str = f"[{form}]({url})" if url else form
+                    filing_desc.append(f"{form_str} on {date}")
+                if filing_desc:
+                    evidence_sentences.append("SEC filings: " + "; ".join(filing_desc) + ".")
+            elif evidence.get("relevant_filings"):
                 evidence_sentences.append("A recent filing gives the story a fresh corporate checkpoint.")
 
-            lines.append(f"{idx}. **{recommendation.get('symbol', 'Unknown')}**")
+            symbol = recommendation.get('symbol', 'Unknown')
+            lines.append(f"{idx}. **{symbol}**")
             lines.append(
-                f"   • **Plain-language view:** {recommendation.get('investment_hypothesis', 'No company rationale available.')}"
-            )
-            lines.append(
-                f"   • **Why now:** {recommendation.get('why_now', 'No timing rationale available.')}"
+                f"   • **Thesis & Timing:** {recommendation.get('investment_hypothesis', 'No company rationale available.')} *Why now:* {recommendation.get('why_now', 'No timing rationale available.')}"
             )
             if evidence_sentences:
                 lines.append(f"   • **Evidence:** {' '.join(evidence_sentences)}")
+            
+            risks = recommendation.get('key_risks', [])
+            invalidators = recommendation.get('what_invalidates_it', [])
+            risks_str = f"Risks: {', '.join(risks)}" if risks else "Risks: early/incomplete."
+            invalidators_str = f"Invalidators: {', '.join(invalidators)}" if invalidators else "Invalidators: catalysts fade."
+            lines.append(f"   • **Risk Profile:** {risks_str} | {invalidators_str}")
             lines.append(
-                f"   • **What could go wrong:** {', '.join(recommendation.get('key_risks', [])) or 'The evidence is still early or incomplete.'}"
-            )
-            lines.append(
-                f"   • **What would change my mind:** {', '.join(recommendation.get('what_invalidates_it', [])) or 'The thesis would weaken if the catalysts fade.'}"
-            )
-            lines.append(
-                f"   • **How to act manually if you agree:** `/add {recommendation.get('symbol', 'TICKER')} PRICE QTY`"
+                f"   • **Action:** `/add {symbol} PRICE QTY`"
             )
             lines.append("")
 

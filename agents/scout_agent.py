@@ -237,7 +237,7 @@ class ScoutAgent:
         company_name = market_data.get("name", symbol)
         return {
             "symbol": symbol,
-            "source_etf": theme.get("mapped_etfs", [""])[0],
+            "source_etf": (theme.get("mapped_etfs") or [""])[0],
             "is_existing_position": symbol in portfolio_symbols,
             "why_this_company": (
                 f"{company_name} appears to be a visible expression of the "

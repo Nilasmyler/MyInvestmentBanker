@@ -28,6 +28,62 @@ else:
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
+NEWS_DIGEST_UNSUPPORTED_COLUMNS = set()
+
+
+def _normalize_symbol(symbol: str) -> str:
+    return (symbol or "").upper().strip()
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _parse_iso_datetime(raw_value: str) -> Optional[datetime]:
+    if not raw_value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+    except Exception:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _normalize_iso_datetime(raw_value: str) -> str:
+    parsed = _parse_iso_datetime(raw_value)
+    if not parsed:
+        return raw_value
+    return parsed.replace(microsecond=0).isoformat()
+
+
+def _get_existing_holding(symbol: str) -> Optional[Dict[str, Any]]:
+    if not supabase_client:
+        return None
+    try:
+        response = supabase_client.table("portfolio_holdings").select("*").eq("symbol", symbol).limit(1).execute()
+        return response.data[0] if response.data else None
+    except Exception as e:
+        logger.error(f"Error fetching holding for {symbol}: {e}")
+        return None
+
+
+def _is_legacy_news_digest_schema_error(error: Exception) -> bool:
+    error_text = str(error)
+    return "news_digests.entity_type" in error_text or "news_digests.entity_key" in error_text
+
+
+def _extract_missing_news_digest_column(error: Exception) -> Optional[str]:
+    error_text = str(error)
+    for column in ["entity_type", "entity_key", "metadata", "article_vector"]:
+        if f"news_digests.{column}" in error_text or f"'{column}' column of 'news_digests'" in error_text:
+            return column
+    return None
+
 
 def get_embedding(text: str, task_type: str = "retrieval_document") -> List[float]:
     """
@@ -54,12 +110,16 @@ def get_embedding(text: str, task_type: str = "retrieval_document") -> List[floa
 # Portfolio CRUD Helpers
 # ==============================================================================
 
-def fetch_portfolio() -> List[Dict[str, Any]]:
+def fetch_portfolio(include_inactive: bool = False) -> List[Dict[str, Any]]:
     if not supabase_client:
         return []
     try:
         response = supabase_client.table("portfolio_holdings").select("*").execute()
-        return response.data
+        holdings = response.data or []
+        if not include_inactive:
+            holdings = [row for row in holdings if _safe_float(row.get("quantity")) > 0]
+        holdings.sort(key=lambda row: str(row.get("symbol", "")))
+        return holdings
     except Exception as e:
         logger.error(f"Error fetching portfolio: {e}")
         return []
@@ -69,11 +129,24 @@ def update_portfolio_holding(symbol: str, qty: float, price: float, name: str = 
     if not supabase_client:
         return False
 
-    symbol = symbol.upper().strip()
+    symbol = _normalize_symbol(symbol)
     try:
         if qty <= 0:
-            supabase_client.table("portfolio_holdings").delete().eq("symbol", symbol).execute()
-            logger.info(f"Deleted ticker {symbol} from holdings (quantity was 0 or less).")
+            existing_holding = _get_existing_holding(symbol)
+            if not existing_holding:
+                logger.info(f"No holding row existed for {symbol}; treating retire request as a no-op.")
+                return True
+
+            payload = {
+                "symbol": symbol,
+                "quantity": 0.0,
+                "cost_basis": _safe_float(existing_holding.get("cost_basis")),
+            }
+            if existing_holding.get("name"):
+                payload["name"] = existing_holding["name"]
+
+            supabase_client.table("portfolio_holdings").upsert(payload).execute()
+            logger.info(f"Retired ticker {symbol} from active holdings while preserving linked history.")
             return True
 
         payload = {
@@ -120,14 +193,27 @@ def replace_portfolio_holdings(holdings: List[Dict[str, Any]]) -> Dict[str, Any]
         )
 
     try:
-        existing_symbols = {row["symbol"].upper().strip() for row in fetch_portfolio() if row.get("symbol")}
+        existing_holdings = {
+            _normalize_symbol(row.get("symbol", "")): row
+            for row in fetch_portfolio()
+            if row.get("symbol")
+        }
+        existing_symbols = set(existing_holdings.keys())
 
         if normalized_holdings:
             supabase_client.table("portfolio_holdings").upsert(normalized_holdings).execute()
 
         removed_symbols = sorted(existing_symbols - incoming_symbols)
         for symbol in removed_symbols:
-            supabase_client.table("portfolio_holdings").delete().eq("symbol", symbol).execute()
+            prior_row = existing_holdings.get(symbol, {})
+            payload = {
+                "symbol": symbol,
+                "quantity": 0.0,
+                "cost_basis": _safe_float(prior_row.get("cost_basis")),
+            }
+            if prior_row.get("name"):
+                payload["name"] = prior_row["name"]
+            supabase_client.table("portfolio_holdings").upsert(payload).execute()
 
         return {
             "ok": True,
@@ -154,7 +240,7 @@ def fetch_investment_thesis(symbol: str) -> Optional[Dict[str, Any]]:
     if not supabase_client:
         return None
     try:
-        response = supabase_client.table("investment_thesis").select("*").eq("symbol", symbol.upper()).execute()
+        response = supabase_client.table("investment_thesis").select("*").eq("symbol", _normalize_symbol(symbol)).execute()
         return response.data[0] if response.data else None
     except Exception as e:
         logger.error(f"Error fetching thesis for {symbol}: {e}")
@@ -165,7 +251,7 @@ def save_investment_thesis(symbol: str, thesis_text: str) -> bool:
     if not supabase_client:
         return False
 
-    symbol = symbol.upper().strip()
+    symbol = _normalize_symbol(symbol)
     try:
         vector = get_embedding(thesis_text, task_type="retrieval_document")
         payload = {
@@ -189,13 +275,26 @@ def save_analyst_memo(symbol: str, period: str, memo_text: str, metrics: Dict[st
     if not supabase_client:
         return False
     try:
+        symbol = _normalize_symbol(symbol)
         payload = {
-            "symbol": symbol.upper().strip(),
+            "symbol": symbol,
             "period": period,
             "memo_text": memo_text,
             "metrics": metrics,
         }
-        supabase_client.table("corporate_analyst_memos").insert(payload).execute()
+        existing = (
+            supabase_client.table("corporate_analyst_memos")
+            .select("id")
+            .eq("symbol", symbol)
+            .eq("period", period)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        if existing.data:
+            supabase_client.table("corporate_analyst_memos").update(payload).eq("id", existing.data[0]["id"]).execute()
+        else:
+            supabase_client.table("corporate_analyst_memos").insert(payload).execute()
         logger.info(f"Saved analyst memo for {symbol} ({period}).")
         return True
     except Exception as e:
@@ -210,12 +309,22 @@ def fetch_historical_memos(symbol: str, limit: int = 2) -> List[Dict[str, Any]]:
         response = (
             supabase_client.table("corporate_analyst_memos")
             .select("*")
-            .eq("symbol", symbol.upper().strip())
+            .eq("symbol", _normalize_symbol(symbol))
             .order("created_at", desc=True)
-            .limit(limit)
+            .limit(max(limit * 4, limit))
             .execute()
         )
-        return response.data
+        unique_memos = []
+        seen_periods = set()
+        for row in response.data or []:
+            period = str(row.get("period", "")).strip().upper()
+            if period in seen_periods:
+                continue
+            seen_periods.add(period)
+            unique_memos.append(row)
+            if len(unique_memos) >= limit:
+                break
+        return unique_memos
     except Exception as e:
         logger.error(f"Error fetching historical memos for {symbol}: {e}")
         return []
@@ -238,13 +347,54 @@ def cache_news_digest(
     if not supabase_client:
         return False
     try:
-        pub_date = published_at if published_at else datetime.now(timezone.utc).isoformat()
+        normalized_symbol = _normalize_symbol(symbol)
+        normalized_entity_key = _normalize_symbol(entity_key or symbol)
+        pub_date = _normalize_iso_datetime(published_at) if published_at else datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        use_legacy_schema = "entity_type" in NEWS_DIGEST_UNSUPPORTED_COLUMNS or "entity_key" in NEWS_DIGEST_UNSUPPORTED_COLUMNS
+        if not use_legacy_schema:
+            try:
+                duplicate_query = (
+                    supabase_client.table("news_digests")
+                    .select("id, published_at, title, url")
+                    .eq("entity_type", entity_type)
+                    .eq("entity_key", normalized_entity_key)
+                )
+                if url:
+                    duplicate_query = duplicate_query.eq("url", url).limit(1)
+                else:
+                    duplicate_query = duplicate_query.eq("title", title).order("published_at", desc=True).limit(5)
+                duplicate_rows = duplicate_query.execute().data or []
+            except Exception as duplicate_error:
+                if not _is_legacy_news_digest_schema_error(duplicate_error):
+                    raise
+                NEWS_DIGEST_UNSUPPORTED_COLUMNS.update({"entity_type", "entity_key"})
+                use_legacy_schema = True
+
+        if use_legacy_schema:
+            duplicate_query = supabase_client.table("news_digests").select("id, published_at, title, url").eq(
+                "symbol",
+                normalized_symbol or normalized_entity_key,
+            )
+            if url:
+                duplicate_query = duplicate_query.eq("url", url).limit(1)
+            else:
+                duplicate_query = duplicate_query.eq("title", title).order("published_at", desc=True).limit(5)
+            duplicate_rows = duplicate_query.execute().data or []
+
+        for row in duplicate_rows:
+            same_url = bool(url) and row.get("url") == url
+            same_title = not url and str(row.get("title", "")).strip() == title.strip()
+            same_published_at = _normalize_iso_datetime(str(row.get("published_at", ""))) == pub_date
+            if same_url or (same_title and same_published_at):
+                logger.info(f"Skipping duplicate cached news for {normalized_entity_key}: {title}")
+                return True
+
         vector_text = f"Title: {title}\nSummary: {summary}"
         vector = get_embedding(vector_text, task_type="retrieval_document")
         payload = {
-            "symbol": symbol.upper().strip() if symbol else None,
+            "symbol": normalized_symbol if normalized_symbol else None,
             "entity_type": entity_type,
-            "entity_key": entity_key or symbol.upper().strip(),
+            "entity_key": normalized_entity_key,
             "title": title,
             "summary": summary,
             "url": url,
@@ -252,7 +402,28 @@ def cache_news_digest(
             "article_vector": vector,
             "metadata": metadata or {},
         }
-        supabase_client.table("news_digests").insert(payload).execute()
+        if use_legacy_schema:
+            payload.pop("entity_type", None)
+            payload.pop("entity_key", None)
+
+        for unsupported_column in list(NEWS_DIGEST_UNSUPPORTED_COLUMNS):
+            payload.pop(unsupported_column, None)
+
+        while True:
+            try:
+                supabase_client.table("news_digests").insert(payload).execute()
+                break
+            except Exception as insert_error:
+                missing_column = _extract_missing_news_digest_column(insert_error)
+                if not missing_column:
+                    raise
+                if missing_column in ["entity_type", "entity_key"]:
+                    NEWS_DIGEST_UNSUPPORTED_COLUMNS.update({"entity_type", "entity_key"})
+                    payload.pop("entity_type", None)
+                    payload.pop("entity_key", None)
+                else:
+                    NEWS_DIGEST_UNSUPPORTED_COLUMNS.add(missing_column)
+                    payload.pop(missing_column, None)
         return True
     except Exception as e:
         logger.error(f"Error caching news for {symbol or entity_key}: {e}")
@@ -264,14 +435,32 @@ def query_semantic_news(symbol: str, query_text: str, limit: int = 5) -> List[Di
         return []
     try:
         _ = get_embedding(query_text, task_type="retrieval_query")
-        response = (
-            supabase_client.table("news_digests")
-            .select("symbol, entity_type, entity_key, title, summary, url, published_at, metadata")
-            .eq("entity_key", symbol.upper().strip())
-            .order("published_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
+        while True:
+            include_entity_fields = "entity_type" not in NEWS_DIGEST_UNSUPPORTED_COLUMNS and "entity_key" not in NEWS_DIGEST_UNSUPPORTED_COLUMNS
+            include_metadata = "metadata" not in NEWS_DIGEST_UNSUPPORTED_COLUMNS
+            select_fields = ["symbol", "title", "summary", "url", "published_at"]
+            if include_entity_fields:
+                select_fields[1:1] = ["entity_type", "entity_key"]
+            if include_metadata:
+                select_fields.append("metadata")
+
+            try:
+                query = supabase_client.table("news_digests").select(", ".join(select_fields)).order("published_at", desc=True).limit(limit)
+                if include_entity_fields:
+                    query = query.eq("entity_key", _normalize_symbol(symbol))
+                else:
+                    query = query.eq("symbol", _normalize_symbol(symbol))
+                response = query.execute()
+                break
+            except Exception as query_error:
+                missing_column = _extract_missing_news_digest_column(query_error)
+                if missing_column in ["entity_type", "entity_key"]:
+                    NEWS_DIGEST_UNSUPPORTED_COLUMNS.update({"entity_type", "entity_key"})
+                    continue
+                if missing_column == "metadata":
+                    NEWS_DIGEST_UNSUPPORTED_COLUMNS.add("metadata")
+                    continue
+                raise
         return response.data
     except Exception as e:
         logger.error(f"Error executing semantic news search: {e}")
@@ -282,11 +471,28 @@ def fetch_recent_cached_events(entity_key: str, entity_type: str = "symbol", lim
     if not supabase_client:
         return []
     try:
+        use_legacy_schema = "entity_type" in NEWS_DIGEST_UNSUPPORTED_COLUMNS or "entity_key" in NEWS_DIGEST_UNSUPPORTED_COLUMNS
+        if not use_legacy_schema:
+            try:
+                response = (
+                    supabase_client.table("news_digests")
+                    .select("*")
+                    .eq("entity_key", entity_key)
+                    .eq("entity_type", entity_type)
+                    .order("published_at", desc=True)
+                    .limit(limit)
+                    .execute()
+                )
+                return response.data
+            except Exception as query_error:
+                if not _is_legacy_news_digest_schema_error(query_error):
+                    raise
+                NEWS_DIGEST_UNSUPPORTED_COLUMNS.update({"entity_type", "entity_key"})
+
         response = (
             supabase_client.table("news_digests")
             .select("*")
-            .eq("entity_key", entity_key)
-            .eq("entity_type", entity_type)
+            .eq("symbol", _normalize_symbol(entity_key))
             .order("published_at", desc=True)
             .limit(limit)
             .execute()
@@ -431,6 +637,7 @@ def save_user_preference(key: str, value: Any) -> bool:
         payload = {
             "key": key,
             "value": value,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         supabase_client.table("user_preferences").upsert(payload).execute()
         logger.info(f"Saved user preference: {key}")

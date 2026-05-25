@@ -16,7 +16,10 @@ def _parse_iso_date(raw_value: str) -> Optional[datetime]:
     if not raw_value:
         return None
     try:
-        return datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except Exception:
         try:
             return datetime.strptime(raw_value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -93,7 +96,38 @@ class OwnershipIntelAgent:
             if alerts:
                 summary = f"{summary} {' '.join(alerts[:2])}"
         elif top_holders or institutional_ownership_pct is not None or insider_ownership_pct is not None:
-            summary = "Ownership snapshot is available, but no fresh SEC ownership catalyst was captured."
+            parts = ["Ownership snapshot shows the following details:"]
+            if institutional_ownership_pct is not None:
+                parts.append(f"Institutional ownership is roughly `{institutional_ownership_pct}%` of shares.")
+            if insider_ownership_pct is not None:
+                parts.append(f"Insider ownership is roughly `{insider_ownership_pct}%` of shares.")
+            if top_holders:
+                top_holders_desc = []
+                for holder in top_holders[:3]:
+                    name = holder.get("holder")
+                    shares = holder.get("shares")
+                    pct = holder.get("pct_out")
+                    if name:
+                        details = []
+                        if shares is not None:
+                            if shares >= 1_000_000:
+                                details.append(f"{shares / 1_000_000:.2f}M shares")
+                            elif shares >= 1_000:
+                                details.append(f"{shares / 1_000:.1f}K shares")
+                            else:
+                                details.append(f"{shares} shares")
+                        if pct is not None:
+                            details.append(f"{pct}%")
+                        if details:
+                            top_holders_desc.append(f"{name} ({', '.join(details)})")
+                        else:
+                            top_holders_desc.append(name)
+                if top_holders_desc:
+                    parts.append(f"Top holders: {'; '.join(top_holders_desc)}.")
+            if len(parts) > 1:
+                summary = " ".join(parts)
+            else:
+                summary = "Ownership snapshot is available, but no fresh SEC ownership catalyst was captured."
         else:
             summary = "Ownership intelligence was thin in this pass."
 

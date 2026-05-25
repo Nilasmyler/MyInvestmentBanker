@@ -1,8 +1,10 @@
 import logging
 import os
 import sys
+from typing import List
 
 from dotenv import load_dotenv
+import requests
 
 load_dotenv()
 
@@ -12,6 +14,59 @@ logger = logging.getLogger("MyInvestmentBanker.tester")
 logger.info("==============================================================================")
 logger.info("        MyInvestmentBanker: Local Pipeline Verification Script (v2)          ")
 logger.info("==============================================================================")
+
+failures: List[str] = []
+
+
+def record_failure(message: str) -> None:
+    failures.append(message)
+    logger.error(message)
+
+
+def verify_live_news_digest_schema() -> None:
+    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_service_key = os.getenv("SUPABASE_SERVICE_KEY")
+    if not supabase_url or not supabase_service_key:
+        logger.info("Supabase credentials missing. Skipping live news_digests schema probe.")
+        return
+
+    headers = {
+        "apikey": supabase_service_key,
+        "Authorization": f"Bearer {supabase_service_key}",
+    }
+    missing_columns: List[str] = []
+    for column in ["entity_type", "entity_key", "metadata"]:
+        response = requests.get(
+            f"{supabase_url}/rest/v1/news_digests",
+            params={"select": column, "limit": 1},
+            headers=headers,
+            timeout=10,
+        )
+        if response.status_code == 200:
+            continue
+
+        try:
+            error_payload = response.json()
+        except Exception:
+            error_payload = {"message": response.text}
+        error_message = str(error_payload.get("message", error_payload))
+        missing_message_markers = [
+            f"news_digests.{column}",
+            f"'{column}' column of 'news_digests'",
+        ]
+        if any(marker in error_message for marker in missing_message_markers):
+            missing_columns.append(column)
+            continue
+
+        raise RuntimeError(
+            f"Supabase news_digests schema probe failed for `{column}` with HTTP {response.status_code}: {error_message}"
+        )
+
+    if missing_columns:
+        raise RuntimeError(
+            "Supabase news_digests schema/cache is missing required columns for the current discovery flow: "
+            + ", ".join(missing_columns)
+        )
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -25,7 +80,7 @@ try:
 
     logger.info("✅ Test 1/6 passed: Core modules imported successfully.")
 except Exception as e:
-    logger.error(f"❌ Test 1/6 failed: Core modules failed to import. Error: {e}")
+    record_failure(f"❌ Test 1/6 failed: Core modules failed to import. Error: {e}")
     sys.exit(1)
 
 
@@ -38,7 +93,7 @@ try:
     logger.info(f"Risk Avoidances: {policy.get('risk_avoidances')}")
     logger.info("✅ Test 2/6 passed: Policy fallback produced structured output.")
 except Exception as e:
-    logger.error(f"❌ Test 2/6 failed: Policy parsing failed. Error: {e}")
+    record_failure(f"❌ Test 2/6 failed: Policy parsing failed. Error: {e}")
 
 
 logger.info("\nTest 3/6: Verifying macro data fallback...")
@@ -50,7 +105,7 @@ try:
     )
     logger.info("✅ Test 3/6 passed: Macro aggregator executed.")
 except Exception as e:
-    logger.error(f"❌ Test 3/6 failed: Macro fetch failed. Error: {e}")
+    record_failure(f"❌ Test 3/6 failed: Macro fetch failed. Error: {e}")
 
 
 logger.info("\nTest 4/6: Verifying Scout material-news filtering...")
@@ -78,7 +133,7 @@ try:
     logger.info(f"Filtered news items: {len(filtered)}")
     logger.info("✅ Test 4/6 passed: Scout produced structured materiality output.")
 except Exception as e:
-    logger.error(f"❌ Test 4/6 failed: Scout filtering failed. Error: {e}")
+    record_failure(f"❌ Test 4/6 failed: Scout filtering failed. Error: {e}")
 
 
 logger.info("\nTest 5/6: Verifying discovery briefing formatting...")
@@ -110,19 +165,29 @@ try:
     logger.info(sample_report)
     logger.info("✅ Test 5/6 passed: Discovery briefing formatted correctly.")
 except Exception as e:
-    logger.error(f"❌ Test 5/6 failed: Discovery briefing formatting failed. Error: {e}")
+    record_failure(f"❌ Test 5/6 failed: Discovery briefing formatting failed. Error: {e}")
 
 
 logger.info("\nTest 6/6: Verifying discovery orchestration fallback behavior...")
 try:
-    result = trigger_opportunity_discovery(run_type="sweep")
-    if result is None or isinstance(result, str):
-        logger.info("✅ Test 6/6 passed: Discovery sweep returned a graceful fallback result.")
+    verify_live_news_digest_schema()
+    result = trigger_opportunity_discovery(run_type="sweep", return_result=True)
+    if result is None:
+        logger.info("✅ Test 6/6 passed: Discovery sweep returned no-op cleanly.")
+    elif isinstance(result, dict) and not result.get("error"):
+        logger.info(
+            "✅ Test 6/6 passed: Discovery sweep completed without surfacing an orchestration error."
+        )
     else:
-        logger.error("❌ Test 6/6 failed: Unexpected discovery sweep return type.")
+        error_summary = result if isinstance(result, str) else getattr(result, "get", lambda *_: None)("summary_text")
+        raise RuntimeError(error_summary or "Unexpected discovery sweep return value.")
 except Exception as e:
-    logger.error(f"❌ Test 6/6 failed: Discovery orchestration failed. Error: {e}")
+    record_failure(f"❌ Test 6/6 failed: Discovery orchestration failed. Error: {e}")
 
 logger.info("\n==============================================================================")
 logger.info("                     Verification Tasks Complete                              ")
 logger.info("==============================================================================")
+
+if failures:
+    logger.error("Verification failed with %s issue(s).", len(failures))
+    sys.exit(1)
