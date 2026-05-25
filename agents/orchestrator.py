@@ -5,15 +5,16 @@ from langgraph.graph import END, StateGraph
 
 from agents.cfa_agent import CFAAgent
 from agents.communication_agent import CommunicationAgent
+from agents.research_planner_agent import ResearchPlannerAgent
 from agents.risk_agent import RiskAgent
 from agents.scout_agent import ScoutAgent
 from database.supabase_client import (
-    fetch_portfolio,
     fetch_recent_discovery_candidates,
     get_user_preference,
     save_discovery_candidates,
     save_discovery_run,
 )
+from services.portfolio_service import get_portfolio_snapshot, should_sync_portfolio_before_analysis
 from utils.discovery_support import get_default_policy_profile, normalize_policy_profile
 
 logger = logging.getLogger("MyInvestmentBanker.orchestrator")
@@ -29,10 +30,20 @@ class AgentState(TypedDict):
     messages: List[Dict[str, str]]
 
 
+def _confidence_rank(confidence_level: str) -> int:
+    if confidence_level == "high":
+        return 3
+    if confidence_level == "medium":
+        return 2
+    if confidence_level == "low":
+        return 1
+    return 0
+
+
 def IngestionNode(state: AgentState) -> Dict[str, Any]:
     logger.info("--- LANGGRAPH: Entering Ingestion Node ---")
-    portfolio = fetch_portfolio()
-    scout_payload = ScoutAgent.run(portfolio)
+    portfolio = get_portfolio_snapshot(sync_from_broker=should_sync_portfolio_before_analysis())
+    scout_payload = ResearchPlannerAgent.run_portfolio_ingestion(portfolio)
     return {
         "portfolio": portfolio,
         "raw_ingested_data": scout_payload,
@@ -52,7 +63,7 @@ def CFAAnalysisNode(state: AgentState) -> Dict[str, Any]:
         ticker_stats = tickers_data.get(symbol, {})
         filing_text = ticker_stats.get("recent_filings", "No filing context available.")
         market_stats = ticker_stats.get("market_data", {})
-        analyst_memo = CFAAgent.run(symbol, filing_text, market_stats)
+        analyst_memo = CFAAgent.run(symbol, filing_text, market_stats, supplemental_context=ticker_stats)
         memos_list.append(analyst_memo)
 
     return {"cfa_analyst_memos": memos_list}
@@ -163,7 +174,7 @@ def trigger_opportunity_discovery(
 ) -> Optional[Any]:
     logger.info(f"Starting theme-led opportunity discovery run ({run_type})...")
     try:
-        portfolio = fetch_portfolio()
+        portfolio = get_portfolio_snapshot(sync_from_broker=should_sync_portfolio_before_analysis())
         policy_profile = _load_policy_profile()
         scout_payload = ScoutAgent.run_theme_discovery(
             policy_profile=policy_profile,
@@ -172,7 +183,9 @@ def trigger_opportunity_discovery(
             focus_override=focus_override,
         )
 
-        themes = scout_payload.get("themes", [])
+        themes = ResearchPlannerAgent.rank_themes(scout_payload.get("themes", []))
+        llm_theme_keys = set(ResearchPlannerAgent.select_llm_theme_keys(themes, run_type=run_type))
+        remaining_llm_candidate_slots = ResearchPlannerAgent.llm_candidate_budget(run_type)
         if not themes:
             summary_text = "No sector or theme became compelling enough to investigate further."
             discovery_run = {
@@ -196,9 +209,29 @@ def trigger_opportunity_discovery(
 
         recommendations: List[Dict[str, Any]] = []
         for theme in themes:
-            candidate_expressions = ScoutAgent.expand_theme_candidates(theme, portfolio)
+            use_llm_for_theme = theme.get("theme_key") in llm_theme_keys and remaining_llm_candidate_slots > 0
+            candidate_expressions = ResearchPlannerAgent.expand_theme_candidates(
+                theme,
+                portfolio,
+                run_type=run_type,
+                candidate_limit=ResearchPlannerAgent.candidate_limit_for_theme(run_type, use_llm_for_theme),
+            )
+            per_theme_llm_budget = min(2 if use_llm_for_theme else 0, remaining_llm_candidate_slots)
+            llm_review_symbols = set(
+                ResearchPlannerAgent.select_llm_review_symbols(
+                    candidate_expressions,
+                    run_type,
+                    budget_override=per_theme_llm_budget,
+                )
+            )
+            remaining_llm_candidate_slots -= len(llm_review_symbols)
             candidate_reviews = [
-                CFAAgent.review_discovery_candidate(theme, candidate_expression, policy_profile)
+                CFAAgent.review_discovery_candidate(
+                    theme,
+                    candidate_expression,
+                    policy_profile,
+                    use_llm=candidate_expression.get("symbol") in llm_review_symbols,
+                )
                 for candidate_expression in candidate_expressions
             ]
             audited_theme = RiskAgent.audit_discovery_theme(
@@ -206,11 +239,25 @@ def trigger_opportunity_discovery(
                 candidate_reviews=candidate_reviews,
                 policy_profile=policy_profile,
                 max_recommendations=2 if run_type == "sweep" else 3,
+                use_llm=use_llm_for_theme,
             )
+            review_by_symbol = {review.get("symbol"): review for review in candidate_reviews if review.get("symbol")}
             for recommendation in audited_theme.get("recommendations", []):
+                matched_review = review_by_symbol.get(recommendation.get("symbol"), {})
+                recommendation["triage_score"] = matched_review.get("triage_score", 0)
+                recommendation["theme_confidence_level"] = theme.get("confidence_level", "low")
                 if not _is_repeat_alert(recommendation, run_type=run_type):
                     recommendations.append(recommendation)
 
+        recommendations.sort(
+            key=lambda item: (
+                _confidence_rank(str(item.get("theme_confidence_level", "low"))),
+                float(item.get("triage_score", 0) or 0),
+                len((item.get("evidence") or {}).get("material_news", [])),
+                len((item.get("evidence") or {}).get("relevant_filings", [])),
+            ),
+            reverse=True,
+        )
         recommendations = recommendations[:3]
         if not recommendations and run_type == "sweep":
             return None

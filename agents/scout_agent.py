@@ -6,7 +6,9 @@ from dotenv import load_dotenv
 from utils.discovery_support import (
     CandidateExpression,
     MaterialNewsItem,
+    OwnershipIntel,
     PolicyProfile,
+    StreetConsensus,
     ThemeHypothesis,
     get_theme_records_for_etfs,
 )
@@ -187,6 +189,10 @@ class ScoutAgent:
         market_data = research.get("market_data", {})
         material_news = research.get("material_news", [])
         relevant_filings = research.get("recent_filings", [])
+        ownership_intel: OwnershipIntel = research.get("ownership_intel", {})
+        street_consensus: StreetConsensus = research.get("street_consensus", {})
+        ownership_has_signal = ownership_intel.get("signal_strength") in ["medium", "high"] and not ownership_intel.get("error")
+        street_has_signal = street_consensus.get("signal_strength") in ["medium", "high"] and not street_consensus.get("error")
 
         catalysts = []
         if material_news:
@@ -195,6 +201,10 @@ class ScoutAgent:
             catalysts.append(
                 f"{relevant_filings[0].get('form', 'Filing')} filed on {relevant_filings[0].get('date', 'unknown date')}"
             )
+        if ownership_has_signal and ownership_intel.get("summary"):
+            catalysts.append(str(ownership_intel.get("summary")))
+        if street_has_signal and street_consensus.get("summary"):
+            catalysts.append(str(street_consensus.get("summary")))
         if abs(market_data.get("five_day_change_pct") or 0) >= 6:
             catalysts.append(
                 f"Shares moved `{market_data.get('five_day_change_pct')}%` over five days while the theme gained attention."
@@ -207,12 +217,18 @@ class ScoutAgent:
             data_gaps.append("No material recent news captured")
         if not relevant_filings:
             data_gaps.append("No fresh SEC filing catalyst")
+        if not ownership_has_signal:
+            data_gaps.append("No fresh ownership catalyst")
+        if not street_has_signal:
+            data_gaps.append("No strong analyst-consensus signal")
 
         signal_count = sum(
             1
             for present in [
                 bool(material_news),
                 bool(relevant_filings),
+                ownership_has_signal,
+                street_has_signal,
                 abs(market_data.get("five_day_change_pct") or 0) >= 6,
             ]
             if present
@@ -234,6 +250,8 @@ class ScoutAgent:
             "data_gaps": data_gaps,
             "theme_key": theme.get("theme_key"),
             "theme_name": theme.get("theme_name"),
+            "ownership_intel": ownership_intel,
+            "street_consensus": street_consensus,
             "signal_count": signal_count,
         }
 
@@ -291,7 +309,7 @@ class ScoutAgent:
         if run_type == "sweep":
             active = (market_trigger and (news_trigger or filing_trigger)) or news_trigger or filing_trigger
         else:
-            active = market_trigger or news_count > 0 or filing_count > 0 or etf_market_data.get("current_price") is not None
+            active = market_trigger or news_count > 0 or filing_count > 0
 
         confidence = "low"
         if len(trigger_sources) >= 3:

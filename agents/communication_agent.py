@@ -10,11 +10,17 @@ from dotenv import load_dotenv
 
 from database.supabase_client import (
     fetch_investment_thesis,
-    fetch_portfolio,
     get_user_preference,
     save_investment_thesis,
     save_user_preference,
     update_portfolio_holding,
+)
+from services.portfolio_service import (
+    brokerage_enabled,
+    get_portfolio_snapshot,
+    should_sync_portfolio_before_analysis,
+    should_sync_portfolio_on_read,
+    sync_portfolio_from_brokerage,
 )
 from utils.discovery_support import (
     build_preference_summary,
@@ -500,17 +506,23 @@ class CommunicationAgent:
     @staticmethod
     def generate_single_stock_analysis(user_id: str, symbol: str, user_context: str = "") -> str:
         from agents.cfa_agent import CFAAgent
+        from agents.research_planner_agent import ResearchPlannerAgent
         from agents.risk_agent import RiskAgent
-        from agents.scout_agent import ScoutAgent
 
         symbol = symbol.upper().strip()
         learning_result = CommunicationAgent.learn_preferences_from_message(user_id, user_context) if user_context else None
         policy_profile = CommunicationAgent._load_policy_profile()
-        portfolio = fetch_portfolio()
+        portfolio = get_portfolio_snapshot(sync_from_broker=should_sync_portfolio_before_analysis())
         portfolio_symbols = {holding["symbol"].upper().strip() for holding in portfolio}
 
-        research = ScoutAgent.collect_symbol_research(symbol)
+        research = ResearchPlannerAgent.collect_symbol_research(
+            symbol,
+            run_type="deep",
+            is_existing_position=symbol in portfolio_symbols,
+        )
         theme = CommunicationAgent._infer_theme_from_symbol_research(symbol, research, policy_profile)
+        from agents.scout_agent import ScoutAgent
+
         candidate_expression = ScoutAgent.build_candidate_expression(theme, research, portfolio_symbols)
         candidate_review = CFAAgent.review_discovery_candidate(theme, candidate_expression, policy_profile)
         risk_audit = RiskAgent.audit_discovery_theme(theme, [candidate_review], policy_profile, max_recommendations=1)
@@ -573,7 +585,7 @@ class CommunicationAgent:
 
     @staticmethod
     def prepare_portfolio_follow_up(user_id: str, portfolio_state: Optional[List[Dict[str, Any]]] = None) -> str:
-        holdings = portfolio_state if portfolio_state is not None else fetch_portfolio()
+        holdings = portfolio_state if portfolio_state is not None else get_portfolio_snapshot(sync_from_broker=False)
         missing_thesis_symbol = ""
         for holding in holdings:
             symbol = holding["symbol"].upper()
@@ -694,6 +706,7 @@ class CommunicationAgent:
                 "You can also tell me things like `I prefer long-term, lower-risk software leaders` and I will learn from that over time.\n\n"
                 "📋 **Available Commands:**\n"
                 "• `/portfolio` — View allocations and cost-basis\n"
+                "• `/sync` — import holdings from the configured brokerage account\n"
                 "• `/add TICKER PRICE QTY` — update a holding\n"
                 "• `/remove TICKER` — remove a holding\n"
                 "• `/thesis TICKER ...` — store your investment thesis\n"
@@ -713,27 +726,96 @@ class CommunicationAgent:
             return "Understood. I cleared the pending follow-up."
 
         if cmd == "/portfolio":
-            holdings = fetch_portfolio()
+            sync_result = None
+            if brokerage_enabled() and should_sync_portfolio_on_read():
+                sync_result = sync_portfolio_from_brokerage()
+                holdings = sync_result.get("holdings", []) if sync_result.get("ok") else get_portfolio_snapshot(sync_from_broker=False)
+            else:
+                holdings = get_portfolio_snapshot(sync_from_broker=False)
+
             if not holdings:
+                if brokerage_enabled():
+                    return (
+                        "📂 **No active holdings are currently loaded.** "
+                        "Use `/sync` to import positions from your brokerage account or `/add TICKER PRICE QTY` to log one manually."
+                    )
                 return "📂 **Your portfolio is currently empty.** Add holdings with `/add TICKER PRICE QTY`."
 
             report = "💼 **Active Portfolio Holdings**\n\n"
+            if sync_result:
+                if sync_result.get("ok"):
+                    report += (
+                        f"Synced from **{sync_result.get('provider', 'brokerage')}** at "
+                        f"`{sync_result.get('fetched_at', 'unknown time')}`.\n\n"
+                    )
+                else:
+                    report += (
+                        f"Brokerage refresh failed, so I am showing the last stored snapshot instead.\n"
+                        f"Reason: `{sync_result.get('reason', 'unknown error')}`\n\n"
+                    )
+
             total_cost = 0.0
+            total_market_value = 0.0
+            have_market_values = False
             for idx, holding in enumerate(holdings):
                 ticker = holding["symbol"]
                 qty = float(holding["quantity"])
                 price = float(holding["cost_basis"])
                 total_cost += qty * price
+                market_value = holding.get("market_value")
+                current_price = holding.get("current_price")
+                if market_value is not None:
+                    total_market_value += float(market_value)
+                    have_market_values = True
                 thesis = fetch_investment_thesis(ticker)
                 thesis_flag = "I have your thesis on file." if thesis else "I still need your thesis for this position."
                 report += (
                     f"{idx + 1}. **{ticker}**\n"
                     f"   • You currently have `{qty:.2f}` shares logged at `{price:.2f}` USD.\n"
                     f"   • In plain language: this is the cost basis I will use when I discuss this holding.\n"
-                    f"   • Thesis status: {thesis_flag}\n\n"
+                    f"   • Thesis status: {thesis_flag}\n"
                 )
+                if current_price is not None:
+                    report += f"   • Latest price seen from the broker: `{float(current_price):.2f}` USD.\n"
+                if market_value is not None:
+                    report += f"   • Current market value: `{float(market_value):.2f}` USD.\n"
+                report += "\n"
             report += f"📊 **Total cost basis logged:** `{total_cost:.2f}` USD"
+            if have_market_values:
+                report += f"\n📈 **Total market value from broker snapshot:** `{total_market_value:.2f}` USD"
             return report
+
+        if cmd == "/sync":
+            if not brokerage_enabled():
+                return (
+                    "⚠️ **Brokerage integration is not configured.** "
+                    "Set `BROKERAGE_PROVIDER` and the provider credentials in `.env` first."
+                )
+
+            sync_result = sync_portfolio_from_brokerage()
+            if not sync_result.get("ok"):
+                return (
+                    "❌ **Brokerage sync failed.**\n"
+                    f"Provider: `{sync_result.get('provider', 'unknown')}`\n"
+                    f"Reason: `{sync_result.get('reason', 'unknown error')}`"
+                )
+
+            removal_text = ""
+            if sync_result.get("removed_symbols"):
+                removal_text = f"\n🧹 Removed closed positions from the tracked portfolio: `{', '.join(sync_result['removed_symbols'])}`"
+
+            persistence_text = ""
+            if not sync_result.get("persisted"):
+                persistence_text = (
+                    "\n⚠️ I could read the brokerage account, but I could not persist the snapshot to Supabase. "
+                    "The live holdings are still usable for the current read."
+                )
+
+            return (
+                f"✅ **Brokerage sync complete.** Imported `{sync_result.get('imported_count', 0)}` holding(s) "
+                f"from **{sync_result.get('provider', 'brokerage')}** at `{sync_result.get('fetched_at', 'unknown time')}`."
+                f"{removal_text}{persistence_text}"
+            )
 
         if cmd == "/add":
             if len(tokens) < 4:
@@ -748,9 +830,12 @@ class CommunicationAgent:
 
             success = update_portfolio_holding(ticker, qty, price)
             if success:
+                broker_note = ""
+                if brokerage_enabled():
+                    broker_note = " A future brokerage sync can overwrite this local holding snapshot."
                 return (
                     f"✅ **Holding updated.** I now have **{ticker}** logged at `{qty:.2f}` shares and "
-                    f"`{price:.2f}` USD as the working cost basis."
+                    f"`{price:.2f}` USD as the working cost basis.{broker_note}"
                 )
             return "❌ **Database write failed.** Check logs."
 
@@ -761,7 +846,10 @@ class CommunicationAgent:
             ticker = tokens[1].upper()
             success = update_portfolio_holding(ticker, 0, 0)
             if success:
-                return f"✅ **Holding removed.** **{ticker}** is no longer in your active portfolio."
+                broker_note = ""
+                if brokerage_enabled():
+                    broker_note = " If the position still exists at the broker, the next sync will add it back."
+                return f"✅ **Holding removed.** **{ticker}** is no longer in your active portfolio.{broker_note}"
             return "❌ **Database write failed.** Check logs."
 
         if cmd == "/thesis":
@@ -770,7 +858,7 @@ class CommunicationAgent:
 
             ticker = tokens[1].upper()
             thesis_text = " ".join(tokens[2:])
-            holdings = fetch_portfolio()
+            holdings = get_portfolio_snapshot(sync_from_broker=False)
             tickers = [holding["symbol"] for holding in holdings]
             if ticker not in tickers:
                 return f"⚠️ **Portfolio mismatch:** Add **{ticker}** first using `/add` before saving a thesis."
@@ -909,6 +997,8 @@ class CommunicationAgent:
         market_data = research.get("market_data", {})
         material_news = research.get("material_news", [])
         relevant_filings = research.get("recent_filings", [])
+        ownership_intel = research.get("ownership_intel", {})
+        street_consensus = research.get("street_consensus", {})
         company_name = market_data.get("name", symbol)
 
         lines = [
@@ -964,6 +1054,10 @@ class CommunicationAgent:
             lines.append(
                 f"• The latest SEC checkpoint is a `{latest_filing.get('form', 'filing')}` from `{latest_filing.get('date', 'unknown date')}`, which gives a fresh corporate anchor for the thesis."
             )
+        if ownership_intel.get("summary"):
+            lines.append(f"• Ownership view: {ownership_intel.get('summary')}")
+        if street_consensus.get("summary"):
+            lines.append(f"• Street view: {street_consensus.get('summary')}")
         if not market_data.get("current_price") and not material_news and not relevant_filings:
             lines.append("• Live evidence was thin in this pass, so treat this as a low-confidence baseline rather than a conviction call.")
 

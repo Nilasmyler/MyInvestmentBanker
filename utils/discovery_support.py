@@ -38,6 +38,35 @@ class ThemeHypothesis(TypedDict, total=False):
     invalidators: List[str]
     candidate_symbols: List[str]
     trigger_sources: List[str]
+    portfolio_overlap: List[str]
+
+
+class OwnershipIntel(TypedDict, total=False):
+    symbol: str
+    summary: str
+    signal_strength: str
+    recent_form4_count: int
+    recent_beneficial_ownership_count: int
+    institutional_ownership_pct: float
+    insider_ownership_pct: float
+    top_holders: List[Dict[str, Any]]
+    recent_filings: List[Dict[str, Any]]
+    alerts: List[str]
+
+
+class StreetConsensus(TypedDict, total=False):
+    symbol: str
+    summary: str
+    signal_strength: str
+    analyst_count: int
+    recommendation_key: str
+    recommendation_mean: float
+    target_mean_price: float
+    target_high_price: float
+    target_low_price: float
+    price_target_premium_pct: float
+    recommendation_breakdown: Dict[str, Any]
+    alerts: List[str]
 
 
 class CandidateExpression(TypedDict, total=False):
@@ -52,6 +81,10 @@ class CandidateExpression(TypedDict, total=False):
     data_gaps: List[str]
     theme_key: str
     theme_name: str
+    ownership_intel: OwnershipIntel
+    street_consensus: StreetConsensus
+    signal_count: int
+    triage_score: float
 
 
 class DiscoveryRecommendation(TypedDict, total=False):

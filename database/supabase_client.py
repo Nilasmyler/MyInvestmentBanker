@@ -92,6 +92,60 @@ def update_portfolio_holding(symbol: str, qty: float, price: float, name: str = 
         return False
 
 
+def replace_portfolio_holdings(holdings: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not supabase_client:
+        return {
+            "ok": False,
+            "persisted": False,
+            "removed_symbols": [],
+            "upserted_count": 0,
+            "reason": "Supabase client is not configured.",
+        }
+
+    normalized_holdings: List[Dict[str, Any]] = []
+    incoming_symbols = set()
+    for holding in holdings:
+        symbol = str(holding.get("symbol", "")).upper().strip()
+        quantity = float(holding.get("quantity", 0) or 0)
+        if not symbol or quantity <= 0:
+            continue
+        incoming_symbols.add(symbol)
+        normalized_holdings.append(
+            {
+                "symbol": symbol,
+                "name": str(holding.get("name", "") or ""),
+                "quantity": quantity,
+                "cost_basis": float(holding.get("cost_basis", 0) or 0),
+            }
+        )
+
+    try:
+        existing_symbols = {row["symbol"].upper().strip() for row in fetch_portfolio() if row.get("symbol")}
+
+        if normalized_holdings:
+            supabase_client.table("portfolio_holdings").upsert(normalized_holdings).execute()
+
+        removed_symbols = sorted(existing_symbols - incoming_symbols)
+        for symbol in removed_symbols:
+            supabase_client.table("portfolio_holdings").delete().eq("symbol", symbol).execute()
+
+        return {
+            "ok": True,
+            "persisted": True,
+            "removed_symbols": removed_symbols,
+            "upserted_count": len(normalized_holdings),
+        }
+    except Exception as e:
+        logger.error(f"Error replacing portfolio holdings: {e}")
+        return {
+            "ok": False,
+            "persisted": False,
+            "removed_symbols": [],
+            "upserted_count": 0,
+            "reason": str(e),
+        }
+
+
 # ==============================================================================
 # Investment Thesis Helpers
 # ==============================================================================

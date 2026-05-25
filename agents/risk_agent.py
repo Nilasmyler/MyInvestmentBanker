@@ -58,6 +58,82 @@ class RiskAgent:
         return {"risk_memo": risk_memo, "summary": risk_memo.split("\n")[0] if risk_memo else ""}
 
     @staticmethod
+    def _sanitize_llm_audit_result(
+        theme: Dict[str, Any],
+        parsed: Any,
+        candidate_reviews: List[Dict[str, Any]],
+        max_recommendations: int,
+    ) -> Optional[Dict[str, Any]]:
+        if not isinstance(parsed, dict):
+            return None
+
+        recommendations = parsed.get("recommendations")
+        rejected = parsed.get("rejected")
+        if not isinstance(recommendations, list) or not isinstance(rejected, list):
+            return None
+
+        review_by_symbol = {
+            str(review.get("symbol", "")).upper().strip(): review
+            for review in candidate_reviews
+            if review.get("symbol")
+        }
+        sanitized_recommendations = []
+        for item in recommendations:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol", "")).upper().strip()
+            review = review_by_symbol.get(symbol)
+            if not review:
+                continue
+            deterministic_shell = {
+                "symbol": review.get("symbol"),
+                "recommendation_type": "increase_existing_position" if review.get("is_existing_position") else "new_position",
+                "theme_name": theme.get("theme_name"),
+                "investment_hypothesis": review.get("thesis_alignment") or review.get("why_this_company"),
+                "why_now": review.get("analyst_verdict"),
+                "key_risks": review.get("cautions", [])[:3] or ["Evidence is still developing."],
+                "what_invalidates_it": theme.get("invalidators", [])[:2],
+                "confidence_note": review.get("confidence_note", "LLM-assisted review."),
+                "source_etf": review.get("source_etf"),
+                "theme_key": theme.get("theme_key"),
+                "status": "recommended",
+                "evidence": {
+                    "catalysts": review.get("company_catalysts", []),
+                    "material_news": review.get("material_news", []),
+                    "relevant_filings": review.get("relevant_filings", []),
+                    "ownership_intel": review.get("ownership_intel", {}),
+                    "street_consensus": review.get("street_consensus", {}),
+                },
+                "rationale": review.get("analyst_verdict", ""),
+            }
+            sanitized_recommendations.append(
+                {
+                    **deterministic_shell,
+                    **item,
+                    "symbol": review.get("symbol"),
+                    "source_etf": review.get("source_etf"),
+                    "theme_key": theme.get("theme_key"),
+                    "theme_name": theme.get("theme_name"),
+                    "evidence": deterministic_shell["evidence"],
+                }
+            )
+            if len(sanitized_recommendations) >= max_recommendations:
+                break
+
+        sanitized_rejected = [item for item in rejected if isinstance(item, dict)]
+        risk_summary = str(parsed.get("risk_summary", "") or "").strip()
+        if not risk_summary:
+            risk_summary = (
+                f"Selected `{len(sanitized_recommendations)}` recommendation(s) from the reviewed candidate set."
+            )
+
+        return {
+            "recommendations": sanitized_recommendations,
+            "rejected": sanitized_rejected,
+            "risk_summary": risk_summary,
+        }
+
+    @staticmethod
     def _build_fallback_recommendations(
         theme: Dict[str, Any],
         candidate_reviews: List[Dict[str, Any]],
@@ -71,6 +147,8 @@ class RiskAgent:
                 item.get("theme_key") in policy_profile.get("preferred_themes", []),
                 item.get("evidence_strength") == "high",
                 item.get("is_existing_position", False),
+                item.get("ownership_intel", {}).get("signal_strength") == "high",
+                item.get("street_consensus", {}).get("signal_strength") == "high",
                 len(item.get("company_catalysts", [])),
                 len(item.get("material_news", [])),
                 len(item.get("relevant_filings", [])),
@@ -94,6 +172,8 @@ class RiskAgent:
                 len(review.get("company_catalysts", []))
                 + len(review.get("material_news", []))
                 + len(review.get("relevant_filings", []))
+                + (1 if review.get("ownership_intel", {}).get("signal_strength") in ["medium", "high"] else 0)
+                + (1 if review.get("street_consensus", {}).get("signal_strength") in ["medium", "high"] else 0)
             )
             if signal_quality <= 0:
                 rejected.append(
@@ -137,6 +217,8 @@ class RiskAgent:
                         "catalysts": review.get("company_catalysts", []),
                         "material_news": review.get("material_news", []),
                         "relevant_filings": review.get("relevant_filings", []),
+                        "ownership_intel": review.get("ownership_intel", {}),
+                        "street_consensus": review.get("street_consensus", {}),
                     },
                     "rationale": review.get("analyst_verdict", ""),
                 }
@@ -161,6 +243,7 @@ class RiskAgent:
         candidate_reviews: List[Dict[str, Any]],
         policy_profile: Dict[str, Any],
         max_recommendations: int = 3,
+        use_llm: bool = True,
     ) -> Dict[str, Any]:
         logger.info(
             f"Risk Agent: Auditing {len(candidate_reviews)} candidates for theme {theme.get('theme_key', 'unknown')}."
@@ -174,7 +257,7 @@ class RiskAgent:
                 "risk_summary": "No candidates were reviewed for this theme.",
             }
 
-        if not llm_available():
+        if not use_llm or not llm_available():
             return RiskAgent._build_fallback_recommendations(
                 theme,
                 candidate_reviews,
@@ -195,7 +278,15 @@ class RiskAgent:
         )
         response = generate_llm_response(str(prompt_payload), system_instruction)
         try:
-            parsed = json.loads(response.strip().replace("```json", "").replace("```", "").strip())
+            raw_parsed = json.loads(response.strip().replace("```json", "").replace("```", "").strip())
+            parsed = RiskAgent._sanitize_llm_audit_result(theme, raw_parsed, candidate_reviews, max_recommendations)
+            if parsed is None:
+                parsed = RiskAgent._build_fallback_recommendations(
+                    theme,
+                    candidate_reviews,
+                    policy_profile=policy_profile,
+                    max_recommendations=max_recommendations,
+                )
         except Exception:
             parsed = RiskAgent._build_fallback_recommendations(
                 theme,

@@ -1,7 +1,7 @@
 import json
 import logging
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
@@ -19,7 +19,35 @@ class CFAAgent:
     """
 
     @staticmethod
-    def run(symbol: str, current_filing_data: str, market_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_supplemental_context(supplemental_context: Optional[Dict[str, Any]] = None) -> str:
+        if not supplemental_context:
+            return "No supplemental ownership or street-consensus context supplied."
+
+        sections = []
+        material_news = supplemental_context.get("material_news", [])
+        if material_news:
+            sections.append(
+                "Recent material news: "
+                + "; ".join([item.get("headline", "") for item in material_news[:2] if item.get("headline")])
+            )
+        ownership_intel = supplemental_context.get("ownership_intel", {})
+        if ownership_intel.get("summary"):
+            sections.append(f"Ownership intelligence: {ownership_intel.get('summary')}")
+        street_consensus = supplemental_context.get("street_consensus", {})
+        if street_consensus.get("summary"):
+            sections.append(f"Street consensus: {street_consensus.get('summary')}")
+        research_plan = supplemental_context.get("research_plan", {})
+        if research_plan.get("reasons"):
+            sections.append(f"Planner routing reasons: {', '.join(research_plan.get('reasons', []))}")
+        return "\n".join(sections) if sections else "Supplemental evidence was thin."
+
+    @staticmethod
+    def run(
+        symbol: str,
+        current_filing_data: str,
+        market_data: Dict[str, Any],
+        supplemental_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         symbol = symbol.upper().strip()
         logger.info(f"CFA Agent: Performing balance sheet audit for {symbol}...")
 
@@ -39,6 +67,13 @@ class CFAAgent:
                 verdict_parts.append(f"Daily move is `{market_data.get('day_change_pct')}%`.")
             if current_filing_data and current_filing_data != "No filing context available.":
                 verdict_parts.append("Recent filing metadata was captured for review.")
+            if supplemental_context:
+                ownership_summary = (supplemental_context.get("ownership_intel") or {}).get("summary")
+                if ownership_summary:
+                    verdict_parts.append(str(ownership_summary))
+                street_summary = (supplemental_context.get("street_consensus") or {}).get("summary")
+                if street_summary:
+                    verdict_parts.append(str(street_summary))
             if not verdict_parts:
                 verdict_parts.append("Only thin market context was available, so this is a low-confidence baseline review.")
 
@@ -58,8 +93,9 @@ class CFAAgent:
                 f"Please conduct a comprehensive fundamental audit for **{symbol}**.\n\n"
                 f"=== 1. Current SEC Filing & Accession Data ===\n{current_filing_data}\n\n"
                 f"=== 2. Market Pricing & Valuation Data ===\n{market_data}\n\n"
-                f"=== 3. Historical Analyst Memory (Past Quarters) ===\n{historical_context}\n\n"
-                f"Structure the response as: Period Under Review, Mathematical Core Calculations, Longitudinal Trends, CFA Synthesis & Verdict."
+                f"=== 3. Supplemental Ownership / Street Context ===\n{CFAAgent._format_supplemental_context(supplemental_context)}\n\n"
+                f"=== 4. Historical Analyst Memory (Past Quarters) ===\n{historical_context}\n\n"
+                f"Structure the response as: Period Under Review, Mathematical Core Calculations, Longitudinal Trends, Ownership & Sentiment Check, CFA Synthesis & Verdict."
             )
             memo_text = generate_llm_response(prompt, system_instruction)
             headline_verdict = memo_text.split("\n")[0] if memo_text else f"Review completed for {symbol}."
@@ -93,6 +129,7 @@ class CFAAgent:
         theme: Dict[str, Any],
         candidate_expression: Dict[str, Any],
         policy_profile: Dict[str, Any],
+        use_llm: bool = True,
     ) -> Dict[str, Any]:
         symbol = candidate_expression.get("symbol", "UNKNOWN")
         logger.info(f"CFA Agent: Reviewing discovery candidate {symbol} for theme {theme.get('theme_key')}.")
@@ -102,8 +139,10 @@ class CFAAgent:
         data_gaps = candidate_expression.get("data_gaps", [])
         filings = candidate_expression.get("relevant_filings", [])
         material_news = candidate_expression.get("material_news", [])
+        ownership_intel = candidate_expression.get("ownership_intel", {})
+        street_consensus = candidate_expression.get("street_consensus", {})
 
-        if not llm_available():
+        if not use_llm or not llm_available():
             strengths = []
             cautions = list(data_gaps)
             company_preferences = policy_profile.get("company_preferences", [])
@@ -114,6 +153,14 @@ class CFAAgent:
                 strengths.append("There is recent material news tied to the company.")
             if filings:
                 strengths.append("A recent SEC filing gives a fresh corporate event to inspect.")
+            if ownership_intel.get("signal_strength") == "high":
+                strengths.append("Ownership data shows a higher-signal insider or beneficial-ownership development.")
+            elif ownership_intel.get("summary"):
+                strengths.append(str(ownership_intel.get("summary")))
+            if street_consensus.get("signal_strength") == "high":
+                strengths.append("Street consensus is active enough to add a useful external cross-check.")
+            elif street_consensus.get("summary"):
+                strengths.append(str(street_consensus.get("summary")))
             if theme.get("theme_key") in policy_profile.get("preferred_themes", []):
                 strengths.append("The theme already matches the user's stated areas of interest.")
             if market_data.get("five_day_change_pct") not in [None, 0]:
@@ -143,8 +190,8 @@ class CFAAgent:
                 "cautions": cautions,
                 "analyst_verdict": analyst_verdict,
                 "confidence_note": (
-                    "Built from structured market/news/filing evidence without Gemini reasoning."
-                    if not llm_available()
+                    "Built from structured market/news/ownership/consensus evidence without Gemini reasoning."
+                    if not use_llm or not llm_available()
                     else "LLM-assisted review."
                 ),
                 "evidence_strength": evidence_strength,
